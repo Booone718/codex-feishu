@@ -230,8 +230,6 @@ type ActiveTask = {
   abortController: AbortController;
 };
 
-const MAX_THREAD_LIST_ITEMS = 5;
-
 export class FeishuBridgeService {
   private readonly adapter: BridgeAdapter;
   private readonly channelType: ChannelType;
@@ -510,7 +508,7 @@ export class FeishuBridgeService {
   }
 
   private async showThreads(message: InboundMessage, currentSessionId: string): Promise<void> {
-    const threads = this.store.listChatThreads(this.channelType, message.address.chatId).slice(0, MAX_THREAD_LIST_ITEMS);
+    const threads = this.store.listChatThreads(this.channelType, message.address.chatId);
     await this.adapter.sendThreadPicker(message.address.chatId, threads, currentSessionId, message.messageId);
   }
 

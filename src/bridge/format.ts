@@ -183,15 +183,14 @@ export function buildPermissionCard(body: string, permissionId: string): string 
 }
 
 export function buildThreadPickerCard(threads: ThreadSummary[], currentSessionId: string): string {
-  const visibleThreads = threads.slice(0, 5);
   const elements: Array<Record<string, unknown>> = [
     {
       tag: 'div',
       text: {
         tag: 'lark_md',
-        content: visibleThreads.length === 0
+        content: threads.length === 0
           ? '当前没有可切换的线程。'
-          : '选择一个线程继续对话。当前仅显示最近 5 个会话，也可以继续使用 `线程列表` 或 `切换线程 2`。',
+          : '选择一个线程继续对话。也可以继续使用 `线程列表` 或 `切换线程 2`。',
       },
     },
     {
@@ -213,7 +212,7 @@ export function buildThreadPickerCard(threads: ThreadSummary[], currentSessionId
     },
   ];
 
-  if (visibleThreads.length === 0) {
+  if (threads.length === 0) {
     return JSON.stringify({
       config: { wide_screen_mode: true },
       header: {
@@ -224,7 +223,7 @@ export function buildThreadPickerCard(threads: ThreadSummary[], currentSessionId
     });
   }
 
-  for (const [index, thread] of visibleThreads.entries()) {
+  for (const [index, thread] of threads.slice(0, 8).entries()) {
     const preview = thread.latestUserPreview || thread.latestMessagePreview || '';
     const title = thread.title || `${thread.displayId.slice(0, 8)}...`;
     const previewLine = preview && preview !== title ? `\n${preview}` : '';
@@ -258,7 +257,7 @@ export function buildThreadPickerCard(threads: ThreadSummary[], currentSessionId
       },
     );
 
-    if (index < visibleThreads.length - 1) {
+    if (index < Math.min(threads.length, 8) - 1) {
       elements.push({ tag: 'hr' });
     }
   }
@@ -274,13 +273,12 @@ export function buildThreadPickerCard(threads: ThreadSummary[], currentSessionId
 }
 
 export function renderThreadListText(threads: ThreadSummary[], currentSessionId: string): string {
-  const visibleThreads = threads.slice(0, 5);
-  if (visibleThreads.length === 0) {
+  if (threads.length === 0) {
     return 'Threads\n\nNo threads found.';
   }
 
-  const lines = ['Threads', '', '当前仅显示最近 5 个会话。', ''];
-  for (const [index, thread] of visibleThreads.entries()) {
+  const lines = ['Threads', ''];
+  for (const [index, thread] of threads.entries()) {
     const current = thread.sessionId === currentSessionId ? ' [current]' : '';
     const title = thread.title || `${thread.displayId.slice(0, 8)}...`;
     lines.push(`${index + 1}. ${title}${current}`);

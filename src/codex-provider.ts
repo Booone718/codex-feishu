@@ -314,12 +314,12 @@ export function humanizeCodexError(text: string): string {
 function toCliExecutionArgs(permissionMode?: string): string[] {
   switch (permissionMode) {
     case 'plan':
-      return ['--sandbox', 'read-only'];
+      return ['--sandbox', 'read-only', '--ask-for-approval', 'never'];
     case 'default':
-      return ['--sandbox', 'read-only'];
+      return ['--sandbox', 'workspace-write', '--ask-for-approval', 'never'];
     case 'acceptEdits':
     default:
-      return ['--full-auto'];
+      return ['--sandbox', 'danger-full-access', '--ask-for-approval', 'never'];
   }
 }
 
@@ -454,8 +454,16 @@ function createCodexEnv(): Record<string, string> {
 }
 
 function shouldUseCodexAppServer(): boolean {
-  return process.env.CODEX_FEISHU_USE_APP_SERVER === 'true'
-    || process.env.CODEX_FEISHU_TRANSPORT === 'app-server';
+  if (process.env.CODEX_FEISHU_TRANSPORT === 'cli') {
+    return false;
+  }
+  if (process.env.CODEX_FEISHU_TRANSPORT === 'app-server') {
+    return true;
+  }
+  if (process.env.CODEX_FEISHU_USE_APP_SERVER === 'false') {
+    return false;
+  }
+  return true;
 }
 
 function sleep(ms: number): Promise<void> {
