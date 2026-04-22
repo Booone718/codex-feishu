@@ -18,6 +18,14 @@ const ENV_WHITELIST = new Set([
   'XDG_DATA_HOME',
   'XDG_CACHE_HOME',
   'SSH_AUTH_SOCK',
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'ALL_PROXY',
+  'NO_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'all_proxy',
+  'no_proxy',
 ]);
 
 function shouldAlwaysStrip(key: string): boolean {

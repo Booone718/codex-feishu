@@ -846,7 +846,11 @@ export class JsonFileStore implements BridgeStore {
   }
 
   private getDesktopPrioritySdkSessionId(record: ThreadRecord): string {
-    return this.getSessionSdkSessionId(record.sessionId) || record.importedSdkSessionId || '';
+    // Only explicitly imported desktop threads should participate in
+    // follow-mode and local rollout mirroring. Bridge-managed Feishu threads
+    // keep their own sdk_session_id, but should not automatically mirror the
+    // active desktop Codex thread.
+    return record.importedSdkSessionId || '';
   }
 
   private buildManagedThreadSummary(record: ThreadRecord): ThreadSummary {

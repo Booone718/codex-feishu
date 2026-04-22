@@ -9,7 +9,6 @@ import type { PendingPermissions } from './permission-gateway.js';
 import { CodexAppServerClient, type AppServerJsonRpcMessage } from './codex-app-server.js';
 import {
   cleanTerminalOutput,
-  CodexCliStdoutParser,
   parseCodexRolloutRecord,
 } from './codex-cli-stream.js';
 import { sseEvent } from './sse-utils.js';
@@ -105,6 +104,16 @@ function shouldRetryFreshThread(message: string): boolean {
   );
 }
 
+function shouldRetryWithoutExtendedHistory(message: string): boolean {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes('cannot access session files at') ||
+    lower.includes('failed to initialize rollout recorder') ||
+    (lower.includes('/.codex/sessions') && lower.includes('permission denied')) ||
+    (lower.includes('rollout recorder') && lower.includes('operation not permitted'))
+  );
+}
+
 const CODEX_WORKSPACE_ERROR_PATTERNS = [
   /deactivated_workspace/i,
   /402\b.*payment required/i,
@@ -159,6 +168,7 @@ const CODEX_CAPABILITY_ERROR_PATTERNS = [
 
 const CODEX_NOISE_PATTERNS = [
   /^Reading prompt from stdin/i,
+  /^Reading additional input from stdin/i,
 ];
 
 export type CodexUserErrorKind = 'workspace' | 'quota' | 'rate_limit' | 'capacity' | 'auth' | 'capability' | false;
@@ -304,12 +314,12 @@ export function humanizeCodexError(text: string): string {
 function toCliExecutionArgs(permissionMode?: string): string[] {
   switch (permissionMode) {
     case 'plan':
-      return ['--sandbox', 'read-only', '--ask-for-approval', 'never'];
+      return ['--sandbox', 'read-only'];
     case 'default':
-      return ['--sandbox', 'workspace-write', '--ask-for-approval', 'never'];
+      return ['--sandbox', 'read-only'];
     case 'acceptEdits':
     default:
-      return ['--sandbox', 'danger-full-access', '--ask-for-approval', 'never'];
+      return ['--full-auto'];
   }
 }
 
@@ -324,8 +334,9 @@ interface CodexCliInvocationInput {
 
 export function buildCodexCliArgs(input: CodexCliInvocationInput): string[] {
   const optionArgs = [
-    '-c', 'skip_git_repo_check=true',
-    '--no-alt-screen',
+    'exec',
+    '--json',
+    '--skip-git-repo-check',
     ...toCliExecutionArgs(input.permissionMode),
   ];
 
@@ -338,7 +349,7 @@ export function buildCodexCliArgs(input: CodexCliInvocationInput): string[] {
   }
 
   if (input.resumeSessionId) {
-    return ['resume', ...optionArgs, input.resumeSessionId, input.prompt];
+    return [...optionArgs, 'resume', input.resumeSessionId, input.prompt];
   }
 
   return [...optionArgs, input.prompt];
@@ -388,7 +399,7 @@ const PYTHON_PTY_PROXY = [
 ].join('\n');
 
 function buildPtyInvocation(codexPath: string, codexArgs: string[]): { command: string; args: string[] } {
-  if (process.platform === 'win32') {
+  if (process.platform === 'win32' || process.env.CODEX_FEISHU_FORCE_PTY !== 'true') {
     return {
       command: codexPath,
       args: codexArgs,
@@ -401,10 +412,34 @@ function buildPtyInvocation(codexPath: string, codexArgs: string[]): { command: 
   };
 }
 
+const CODEX_PARENT_CONTEXT_ENV_KEYS = [
+  'CODEX_THREAD_ID',
+  'CODEX_INTERNAL_ORIGINATOR_OVERRIDE',
+  'CODEX_SHELL',
+  '__CFBundleIdentifier',
+  'TERM_PROGRAM',
+  'TERM_PROGRAM_VERSION',
+];
+
+const CODEX_PARENT_CONTEXT_ENV_PREFIXES = [
+  'VSCODE_',
+];
+
 function createCodexEnv(): Record<string, string> {
   const env = buildSubprocessEnv();
   env.TERM = 'xterm-256color';
   env.COLORTERM = 'truecolor';
+
+  // Codex launched from inside the desktop app inherits parent-thread context
+  // env vars. Strip them so bridge-created app-server sessions stay isolated.
+  for (const key of CODEX_PARENT_CONTEXT_ENV_KEYS) {
+    delete env[key];
+  }
+  for (const key of Object.keys(env)) {
+    if (CODEX_PARENT_CONTEXT_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) {
+      delete env[key];
+    }
+  }
 
   if (process.env.CODEX_FEISHU_API_KEY) {
     env.OPENAI_API_KEY ||= process.env.CODEX_FEISHU_API_KEY;
@@ -416,6 +451,11 @@ function createCodexEnv(): Record<string, string> {
   }
 
   return env;
+}
+
+function shouldUseCodexAppServer(): boolean {
+  return process.env.CODEX_FEISHU_USE_APP_SERVER === 'true'
+    || process.env.CODEX_FEISHU_TRANSPORT === 'app-server';
 }
 
 function sleep(ms: number): Promise<void> {
@@ -1111,18 +1151,38 @@ export class CodexProvider implements LLMProvider {
               resumeSessionId = undefined;
             }
 
-            const summary = await provider.runCodexAppServer(controller, params, resumeSessionId, tempFiles);
+            if (shouldUseCodexAppServer()) {
+              const summary = await provider.runCodexAppServer(controller, params, resumeSessionId, tempFiles);
+
+              if (summary.sessionId) {
+                provider.threadIds.set(params.sessionId, summary.sessionId);
+              }
+
+              if (!params.abortController?.signal.aborted) {
+                controller.enqueue(sseEvent('result', {
+                  ...(summary.usage ? { usage: summary.usage } : {}),
+                  ...(summary.sessionId ? { session_id: summary.sessionId } : {}),
+                  ...(summary.finalAnswer ? { final_text: summary.finalAnswer } : {}),
+                }));
+              }
+              controller.close();
+              return;
+            }
+
+            const summary = await provider.runCodexCli(controller, params, resumeSessionId, tempFiles);
 
             if (summary.sessionId) {
               provider.threadIds.set(params.sessionId, summary.sessionId);
             }
 
-            if (!params.abortController?.signal.aborted) {
+            if (!params.abortController?.signal.aborted && summary.exitCode === 0) {
               controller.enqueue(sseEvent('result', {
                 ...(summary.usage ? { usage: summary.usage } : {}),
                 ...(summary.sessionId ? { session_id: summary.sessionId } : {}),
                 ...(summary.finalAnswer ? { final_text: summary.finalAnswer } : {}),
               }));
+            } else if (!params.abortController?.signal.aborted && summary.errorText) {
+              controller.enqueue(sseEvent('error', humanizeCodexError(summary.errorText)));
             }
             controller.close();
           } catch (error) {
@@ -1184,23 +1244,40 @@ export class CodexProvider implements LLMProvider {
 
     this.streamedTextBySession.set(params.sessionId, '');
 
-    const threadResponse = resumeSessionId
-      ? await client.request<Record<string, unknown>>('thread/resume', {
-          threadId: resumeSessionId,
-          cwd: workingDirectory,
-          approvalPolicy,
-          sandbox,
-          ...(model ? { model } : {}),
-          persistExtendedHistory: true,
-        })
-      : await client.request<Record<string, unknown>>('thread/start', {
-          cwd: workingDirectory,
-          approvalPolicy,
-          sandbox,
-          ...(model ? { model } : {}),
-          experimentalRawEvents: false,
-          persistExtendedHistory: true,
-        });
+    const requestThread = async (persistExtendedHistory: boolean) => (
+      resumeSessionId
+        ? await client.request<Record<string, unknown>>('thread/resume', {
+            threadId: resumeSessionId,
+            cwd: workingDirectory,
+            approvalPolicy,
+            sandbox,
+            ...(model ? { model } : {}),
+            persistExtendedHistory,
+          })
+        : await client.request<Record<string, unknown>>('thread/start', {
+            cwd: workingDirectory,
+            approvalPolicy,
+            sandbox,
+            ...(model ? { model } : {}),
+            experimentalRawEvents: false,
+            persistExtendedHistory,
+          })
+    );
+
+    let threadResponse: Record<string, unknown>;
+    try {
+      threadResponse = await requestThread(true);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!shouldRetryWithoutExtendedHistory(message)) {
+        throw error;
+      }
+
+      console.warn(
+        '[codex-feishu] Codex app-server cannot persist extended history; retrying without session-file persistence.',
+      );
+      threadResponse = await requestThread(false);
+    }
 
     const thread = (threadResponse.thread ?? {}) as Record<string, unknown>;
     const threadId = typeof thread.id === 'string' ? thread.id : resumeSessionId;
@@ -1623,7 +1700,6 @@ export class CodexProvider implements LLMProvider {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    const stdoutParser = new CodexCliStdoutParser();
     const startTimeMs = Date.now();
     let stdoutRaw = '';
     let stderrRaw = '';
@@ -1641,13 +1717,14 @@ export class CodexProvider implements LLMProvider {
     child.stdout.on('data', (chunk: Buffer) => {
       const text = chunk.toString('utf8');
       stdoutRaw = appendCapped(stdoutRaw, text);
-      if (!rolloutTextMode && !completionRequested) {
-        stdoutParser.push(chunk);
-      }
     });
     child.stderr.on('data', (chunk: Buffer) => {
       stderrRaw = appendCapped(stderrRaw, chunk.toString('utf8'));
     });
+
+    // `codex exec` appends any open stdin as extra prompt content. Close it
+    // immediately because bridge prompts are passed as argv.
+    child.stdin.end();
 
     const exitPromise = this.waitForExit(child);
     const requestCompletion = (finalAnswer?: string) => {
@@ -1697,9 +1774,6 @@ export class CodexProvider implements LLMProvider {
 
     const [exit, rollout] = await Promise.all([exitPromise, rolloutPromise]);
 
-    stdoutParser.flush();
-
-    const streamedText = this.streamedTextBySession.get(params.sessionId) || '';
     const errorText = [stderrRaw, cleanTerminalOutput(stdoutRaw)]
       .map((text) => text.trim())
       .filter(Boolean)
