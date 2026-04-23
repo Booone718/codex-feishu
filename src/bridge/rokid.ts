@@ -6,11 +6,13 @@ import type {
   BridgeAdapter,
   FileAttachment,
   InboundMessage,
+  ProjectSummary,
   SendResult,
+  ThreadPickerOptions,
   ThreadSummary,
   ToolProgress,
 } from './contracts.js';
-import { htmlToMarkdown, renderThreadListText } from './format.js';
+import { htmlToMarkdown, renderProjectListText, renderThreadListText } from './format.js';
 
 type InboundHandler = (message: InboundMessage) => Promise<void>;
 
@@ -238,8 +240,13 @@ export class RokidAdapter implements BridgeAdapter {
     threads: ThreadSummary[],
     currentSessionId: string,
     replyToMessageId?: string,
+    options?: ThreadPickerOptions,
   ): Promise<SendResult> {
-    return this.sendText(chatId, renderThreadListText(threads, currentSessionId), replyToMessageId);
+    return this.sendText(chatId, renderThreadListText(threads, currentSessionId, options), replyToMessageId);
+  }
+
+  async sendProjectPicker(chatId: string, projects: ProjectSummary[], replyToMessageId?: string): Promise<SendResult> {
+    return this.sendText(chatId, renderProjectListText(projects), replyToMessageId);
   }
 
   async sendCommandReply(chatId: string, text: string, replyToMessageId?: string): Promise<void> {

@@ -183,6 +183,18 @@ function mapThreadShortcut(rawText: string): string | null {
   return null;
 }
 
+function encodeProjectRoot(rootPath: string): string {
+  return encodeURIComponent(rootPath);
+}
+
+function decodeProjectRoot(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 function permissionResolutionFromAction(action: string): {
   behavior: 'allow' | 'deny';
   updatedPermissions?: unknown[];
@@ -337,6 +349,29 @@ export class FeishuBridgeService {
       return;
     }
 
+    if (callbackData === 'project:list') {
+      await this.showProjects(message);
+      return;
+    }
+
+    if (callbackData.startsWith('project:threads:')) {
+      const projectRoot = decodeProjectRoot(callbackData.slice('project:threads:'.length));
+      await this.showProjectThreads(message, projectRoot);
+      return;
+    }
+
+    if (callbackData.startsWith('project:use:')) {
+      const projectRoot = decodeProjectRoot(callbackData.slice('project:use:'.length));
+      await this.selectProject(message, projectRoot);
+      return;
+    }
+
+    if (callbackData.startsWith('project:new:')) {
+      const projectRoot = decodeProjectRoot(callbackData.slice('project:new:'.length));
+      await this.createAndSwitchThread(message, projectRoot);
+      return;
+    }
+
     if (callbackData === 'thread:list') {
       const binding = this.resolveBinding(message.address.chatId);
       await this.showThreads(message, binding.codepilotSessionId);
@@ -344,7 +379,8 @@ export class FeishuBridgeService {
     }
 
     if (callbackData === 'thread:new') {
-      await this.createAndSwitchThread(message, this.config.defaultWorkDir);
+      const binding = this.resolveBinding(message.address.chatId);
+      await this.createAndSwitchThread(message, this.resolveNewThreadWorkdir(binding));
       return;
     }
   }
@@ -392,6 +428,8 @@ export class FeishuBridgeService {
           '/mode code|plan|ask - Change mode',
           '/status - Show current thread',
           '/threads - Show thread picker',
+          '/projects - Show Codex projects',
+          '/project list | use <id> | threads <id> | new <id>',
           '/thread switch <id|index> - Switch thread',
           '/stop - Stop current task',
           '/perm allow|allow_session|deny <id> - Resolve permission',
@@ -400,7 +438,9 @@ export class FeishuBridgeService {
         return;
 
       case '/new': {
-        const workDir = args && isAbsoluteDir(args) ? args : this.config.defaultWorkDir;
+        const workDir = args && isAbsoluteDir(args)
+          ? args
+          : this.resolveNewThreadWorkdir(binding);
         await this.createAndSwitchThread(message, workDir);
         return;
       }
@@ -410,7 +450,10 @@ export class FeishuBridgeService {
           await this.adapter.sendText(message.address.chatId, 'Usage: /cwd /absolute/path', message.messageId);
           return;
         }
-        this.store.updateChannelBinding(binding.id, { workingDirectory: args });
+        this.store.updateChannelBinding(binding.id, {
+          workingDirectory: args,
+          preferredWorkingDirectory: args,
+        });
         this.store.touchChatThread(this.channelType, message.address.chatId, binding.codepilotSessionId, { workingDirectory: args });
         await this.adapter.sendCommandReply(message.address.chatId, `Working directory set to <code>${escapeHtml(args)}</code>`, message.messageId);
         return;
@@ -440,6 +483,9 @@ export class FeishuBridgeService {
         if (summary?.latestUserPreview) {
           lines.push(`Recent: ${escapeHtml(summary.latestUserPreview)}`);
         }
+        if (binding.preferredWorkingDirectory && binding.preferredWorkingDirectory !== binding.workingDirectory) {
+          lines.push(`Project: <code>${escapeHtml(binding.preferredWorkingDirectory)}</code>`);
+        }
         if (busy) {
           lines.push('Busy: <b>desktop thread active</b>');
         }
@@ -449,6 +495,10 @@ export class FeishuBridgeService {
 
       case '/threads':
         await this.showThreads(message, binding.codepilotSessionId);
+        return;
+
+      case '/projects':
+        await this.showProjects(message);
         return;
 
       case '/thread':
@@ -465,10 +515,35 @@ export class FeishuBridgeService {
           return;
         }
         if (args === 'new') {
-          await this.createAndSwitchThread(message, this.config.defaultWorkDir);
+          await this.createAndSwitchThread(message, this.resolveNewThreadWorkdir(binding));
           return;
         }
         await this.adapter.sendText(message.address.chatId, 'Usage: /thread list | /thread switch <index|id>', message.messageId);
+        return;
+
+      case '/project':
+        if (!args || args === 'list') {
+          await this.showProjects(message);
+          return;
+        }
+        if (args.startsWith('use ')) {
+          await this.selectProject(message, args.slice('use '.length).trim());
+          return;
+        }
+        if (args.startsWith('threads ')) {
+          await this.showProjectThreads(message, args.slice('threads '.length).trim());
+          return;
+        }
+        if (args.startsWith('new ')) {
+          const project = this.store.findCodexProject(args.slice('new '.length).trim());
+          if (!project) {
+            await this.adapter.sendText(message.address.chatId, 'Project not found.', message.messageId);
+            return;
+          }
+          await this.createAndSwitchThread(message, project.rootPath);
+          return;
+        }
+        await this.adapter.sendText(message.address.chatId, 'Usage: /project list | /project use <index|name> | /project threads <index|name> | /project new <index|name>', message.messageId);
         return;
 
       case '/stop': {
@@ -509,14 +584,81 @@ export class FeishuBridgeService {
 
   private async showThreads(message: InboundMessage, currentSessionId: string): Promise<void> {
     const threads = this.store.listChatThreads(this.channelType, message.address.chatId);
-    await this.adapter.sendThreadPicker(message.address.chatId, threads, currentSessionId, message.messageId);
+    await this.adapter.sendThreadPicker(
+      message.address.chatId,
+      threads,
+      currentSessionId,
+      message.messageId,
+      {
+        title: '最近线程',
+        maxItems: 8,
+        inlineRows: true,
+        includeProjectLabel: true,
+      },
+    );
+  }
+
+  private async showProjects(message: InboundMessage): Promise<void> {
+    const projects = this.store.listCodexProjects();
+    await this.adapter.sendProjectPicker(message.address.chatId, projects, message.messageId);
+  }
+
+  private async showProjectThreads(message: InboundMessage, identifier: string): Promise<void> {
+    const project = this.store.findCodexProject(identifier);
+    if (!project) {
+      await this.adapter.sendText(message.address.chatId, 'Project not found.', message.messageId);
+      return;
+    }
+
+    const binding = this.resolveBinding(message.address.chatId);
+    const threads = this.store.listProjectThreads(this.channelType, message.address.chatId, project.rootPath);
+    await this.adapter.sendThreadPicker(
+      message.address.chatId,
+      threads,
+      binding.codepilotSessionId,
+      message.messageId,
+      {
+        title: `${project.displayName} · 线程`,
+        subtitle: `项目：${project.displayName}`,
+        actions: [
+          { label: '项目列表', callbackData: 'project:list', style: 'default' },
+          {
+            label: binding.preferredWorkingDirectory === project.rootPath ? '当前项目' : '使用项目',
+            callbackData: `project:use:${encodeProjectRoot(project.rootPath)}`,
+            style: 'default',
+            disabled: binding.preferredWorkingDirectory === project.rootPath,
+          },
+          { label: '在此新建', callbackData: `project:new:${encodeProjectRoot(project.rootPath)}`, style: 'primary' },
+        ],
+      },
+    );
+  }
+
+  private async selectProject(message: InboundMessage, identifier: string): Promise<void> {
+    const project = this.store.findCodexProject(identifier);
+    if (!project) {
+      await this.adapter.sendText(message.address.chatId, 'Project not found.', message.messageId);
+      return;
+    }
+
+    const binding = this.resolveBinding(message.address.chatId);
+    this.store.updateChannelBinding(binding.id, {
+      preferredWorkingDirectory: project.rootPath,
+    });
+    await this.adapter.sendCommandReply(
+      message.address.chatId,
+      `<b>已切换当前项目</b>\n\n<b>${escapeHtml(project.displayName)}</b>\n<code>${escapeHtml(project.rootPath)}</code>\n\n后续 <code>/new</code> 会默认在这个项目下创建线程。`,
+      message.messageId,
+    );
   }
 
   private async createAndSwitchThread(message: InboundMessage, workDir?: string): Promise<void> {
     const newBinding = this.createBinding(message.address.chatId, workDir);
+    const summary = this.store.describeChatThread(this.channelType, message.address.chatId, newBinding.codepilotSessionId);
+    const title = summary?.title || '新线程';
     await this.adapter.sendCommandReply(
       message.address.chatId,
-      `New thread created.\nSession: <code>${newBinding.codepilotSessionId.slice(0, 8)}...</code>\nCWD: <code>${escapeHtml(newBinding.workingDirectory)}</code>`,
+      `<b>已新建线程</b>\n\n<b>${escapeHtml(title)}</b>`,
       message.messageId,
     );
   }
@@ -542,6 +684,7 @@ export class FeishuBridgeService {
       codepilotSessionId: resolved.sessionId,
       sdkSessionId: resolved.sdkSessionId,
       workingDirectory: resolved.workingDirectory,
+      preferredWorkingDirectory: resolved.workingDirectory,
       model: resolved.model,
       updatedAt: new Date().toISOString(),
     });
@@ -631,6 +774,7 @@ export class FeishuBridgeService {
         workingDirectory: binding.workingDirectory,
         model: binding.model,
       });
+      this.store.syncBridgeThreadFromLocal(binding.codepilotSessionId);
 
       if (result.responseText) {
         await this.adapter.finalizeResponse(message.address.chatId, 'completed', result.responseText, message.messageId);
@@ -786,11 +930,21 @@ export class FeishuBridgeService {
       const session = this.store.getSession(existing.codepilotSessionId);
       if (session) return existing;
     }
-    return this.createBinding(chatId, this.config.defaultWorkDir);
+    return this.createBinding(chatId, this.resolveDefaultWorkdir());
+  }
+
+  private resolveDefaultWorkdir(): string {
+    return this.store.getDefaultChatRoot() || this.config.defaultWorkDir;
+  }
+
+  private resolveNewThreadWorkdir(binding: ChannelBinding): string {
+    return binding.preferredWorkingDirectory
+      || binding.workingDirectory
+      || this.resolveDefaultWorkdir();
   }
 
   private createBinding(chatId: string, workDir?: string): ChannelBinding {
-    const workingDirectory = workDir || this.config.defaultWorkDir;
+    const workingDirectory = workDir || this.resolveDefaultWorkdir();
     const model = this.config.defaultModel || '';
     const session = this.store.createSession(
       `${this.adapter.displayName} ${chatId}`,
@@ -808,12 +962,16 @@ export class FeishuBridgeService {
       chatId,
       codepilotSessionId: session.id,
       workingDirectory: session.working_directory,
+      preferredWorkingDirectory: session.working_directory,
       model: session.model,
     });
+    const initialTitle = session.working_directory === this.store.getDefaultChatRoot()
+      ? '新线程'
+      : (path.basename(session.working_directory) || '新线程');
     this.store.touchChatThread(this.channelType, chatId, binding.codepilotSessionId, {
       workingDirectory: session.working_directory,
       model: session.model,
-      title: `thread · ${session.id.slice(0, 8)}`,
+      title: initialTitle,
       touch: false,
     });
     return binding;

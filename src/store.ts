@@ -17,6 +17,7 @@ import type {
   AuditLogInput,
   PermissionLinkInput,
   PermissionLinkRecord,
+  ProjectSummary,
   OutboundRefInput,
   UpsertChannelBindingInput,
 } from './bridge/contracts.js';
@@ -27,9 +28,11 @@ import { parseCodexRolloutRecord } from './codex-cli-stream.js';
 const DATA_DIR = path.join(BRIDGE_HOME, 'data');
 const MESSAGES_DIR = path.join(DATA_DIR, 'messages');
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+const CODEX_GLOBAL_STATE_PATH = path.join(CODEX_HOME, '.codex-global-state.json');
 const CODEX_SESSIONS_DIR = path.join(CODEX_HOME, 'sessions');
 const CODEX_SESSION_INDEX_PATH = path.join(CODEX_HOME, 'session_index.jsonl');
 const MAX_STORED_MESSAGE_CHARS = 160_000;
+const LOCAL_THREAD_TITLE_MAX_CHARS = 48;
 const LOCAL_THREAD_ANALYSIS_TAIL_BYTES = 2 * 1024 * 1024;
 const LOCAL_THREAD_BUSY_STALE_MS = 30 * 60 * 1000;
 const LOCAL_THREAD_FOLLOW_INTERVAL_MS = 250;
@@ -74,6 +77,25 @@ function normalizeWhitespace(value: string): string {
 
 function normalizePromptText(value: string): string {
   return value.replace(/\r\n/g, '\n').trim();
+}
+
+function uniqueStrings(values: string[]): string[] {
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+  for (const value of values) {
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    ordered.push(value);
+  }
+  return ordered;
+}
+
+function isPathWithinRoot(rootPath: string, targetPath: string): boolean {
+  if (!rootPath || !targetPath) return false;
+  const resolvedRoot = path.resolve(rootPath);
+  const resolvedTarget = path.resolve(targetPath);
+  const relative = path.relative(resolvedRoot, resolvedTarget);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
 function parseRecordTimestampMs(record: string): number | null {
@@ -320,12 +342,14 @@ function isUsefulConversationPreview(value: string): boolean {
 function isUsefulThreadListPreview(value: string): boolean {
   const normalized = value.trim().toLowerCase();
   if (!normalized) return false;
+  if (normalized === 'threads') return false;
   if (normalized.startsWith('threads ')) return false;
   if (normalized.includes('&nbsp;')) return false;
-  if (normalized.includes('切换线程')) return false;
-  if (normalized.includes('线程列表')) return false;
-  if (normalized.includes('/thread')) return false;
-  if (normalized.includes('/threads')) return false;
+  if (/^切换线程(?:\s|$)/u.test(normalized)) return false;
+  if (/^线程列表(?:\s|$)/u.test(normalized)) return false;
+  if (/^项目列表(?:\s|$)/u.test(normalized)) return false;
+  if (/^\/projects?(?:\s|$)/.test(normalized)) return false;
+  if (/^\/thread(?:s)?(?:\s|$)/.test(normalized)) return false;
   return true;
 }
 
@@ -338,6 +362,13 @@ function formatThreadTimestamp(value: string): string {
   const hours = String(date.getHours()).padStart(2, '0');
   const minutes = String(date.getMinutes()).padStart(2, '0');
   return `${month}-${day} ${hours}:${minutes}`;
+}
+
+function truncateThreadTitle(value: string, maxChars = LOCAL_THREAD_TITLE_MAX_CHARS): string {
+  const normalized = normalizeWhitespace(value);
+  if (!normalized) return '';
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
 }
 
 function truncateStoredMessage(value: string, maxChars = MAX_STORED_MESSAGE_CHARS): string {
@@ -395,6 +426,7 @@ export interface ThreadSummary extends ThreadRecord {
   lastActiveLabel: string;
   sdkSessionId: string;
   displayId: string;
+  projectLabel: string;
   source: 'managed' | 'local';
   importable: boolean;
 }
@@ -443,6 +475,14 @@ interface BusyLocalThreadState {
   tools: ThreadToolState[];
 }
 
+interface CodexGlobalStateSnapshot {
+  projectRoots: string[];
+  projectlessRoots: string[];
+  projectlessThreadIds: Set<string>;
+  activeWorkspaceRoots: Set<string>;
+  threadWorkspaceRootHints: Map<string, string>;
+}
+
 // ── Store ──
 
 export class JsonFileStore implements BridgeStore {
@@ -460,6 +500,12 @@ export class JsonFileStore implements BridgeStore {
     | {
         loadedAt: number;
         entries: Map<string, LocalCodexThread>;
+      }
+    | null = null;
+  private codexGlobalStateCache:
+    | {
+        loadedAt: number;
+        snapshot: CodexGlobalStateSnapshot;
       }
     | null = null;
 
@@ -624,7 +670,104 @@ export class JsonFileStore implements BridgeStore {
 
   private defaultThreadTitle(sessionId: string, workingDirectory?: string): string {
     const base = workingDirectory ? path.basename(workingDirectory) : 'thread';
-    return `${base || 'thread'} · ${sessionId.slice(0, 8)}`;
+    return base || 'thread';
+  }
+
+  private fallbackLocalThreadTitle(latestUserPreview: string, workingDirectory: string, lastActiveAt: string): string {
+    const previewTitle = truncateThreadTitle(latestUserPreview);
+    if (previewTitle) {
+      return previewTitle;
+    }
+
+    const base = path.basename(workingDirectory) || '聊天';
+    const timestamp = formatThreadTimestamp(lastActiveAt);
+    return [base, timestamp].filter(Boolean).join(' ｜ ') || '新线程';
+  }
+
+  private upsertCodexSessionIndexEntry(sessionId: string, threadName: string): void {
+    if (!sessionId || !threadName) return;
+
+    let raw = '';
+    try {
+      raw = fs.readFileSync(CODEX_SESSION_INDEX_PATH, 'utf-8');
+    } catch {
+      raw = '';
+    }
+
+    const entries: Array<Record<string, unknown>> = [];
+    let found = false;
+    for (const line of raw.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        if (parsed.id === sessionId) {
+          entries.push({
+            ...parsed,
+            id: sessionId,
+            thread_name: threadName,
+            updated_at: now(),
+          });
+          found = true;
+        } else {
+          entries.push(parsed);
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    if (!found) {
+      entries.push({
+        id: sessionId,
+        thread_name: threadName,
+        updated_at: now(),
+      });
+    }
+
+    ensureDir(path.dirname(CODEX_SESSION_INDEX_PATH));
+    atomicWrite(
+      CODEX_SESSION_INDEX_PATH,
+      `${entries.map((entry) => JSON.stringify(entry)).join('\n')}\n`,
+    );
+  }
+
+  private syncCodexGlobalThreadState(sdkSessionId: string, workingDirectory: string): void {
+    if (!sdkSessionId || !path.isAbsolute(workingDirectory)) return;
+
+    let raw = '';
+    let parsed: Record<string, unknown> = {};
+    try {
+      raw = fs.readFileSync(CODEX_GLOBAL_STATE_PATH, 'utf-8');
+      parsed = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      parsed = {};
+    }
+
+    const snapshot = this.loadCodexGlobalState();
+    const rootPath = this.getProjectRootForWorkingDirectory(workingDirectory, snapshot) || workingDirectory;
+    if (!path.isAbsolute(rootPath)) return;
+
+    const stringArray = (value: unknown): string[] => (
+      Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0) : []
+    );
+
+    const nextHints = {
+      ...((parsed['thread-workspace-root-hints'] ?? {}) as Record<string, unknown>),
+      [sdkSessionId]: rootPath,
+    };
+    const nextProjectlessThreadIds = new Set<string>(stringArray(parsed['projectless-thread-ids']));
+    if (snapshot.projectRoots.includes(rootPath)) {
+      nextProjectlessThreadIds.delete(sdkSessionId);
+    } else {
+      nextProjectlessThreadIds.add(sdkSessionId);
+    }
+
+    parsed['thread-workspace-root-hints'] = nextHints;
+    parsed['projectless-thread-ids'] = Array.from(nextProjectlessThreadIds);
+
+    ensureDir(path.dirname(CODEX_GLOBAL_STATE_PATH));
+    atomicWrite(CODEX_GLOBAL_STATE_PATH, JSON.stringify(parsed, null, 2));
+    this.codexGlobalStateCache = null;
   }
 
   private listRolloutFiles(dir: string): string[] {
@@ -677,6 +820,91 @@ export class JsonFileStore implements BridgeStore {
     }
 
     return titles;
+  }
+
+  private loadCodexGlobalState(): CodexGlobalStateSnapshot {
+    const cacheTtlMs = 10_000;
+    if (this.codexGlobalStateCache && Date.now() - this.codexGlobalStateCache.loadedAt < cacheTtlMs) {
+      return this.codexGlobalStateCache.snapshot;
+    }
+
+    let raw = '';
+    try {
+      raw = fs.readFileSync(CODEX_GLOBAL_STATE_PATH, 'utf-8');
+    } catch {
+      const empty: CodexGlobalStateSnapshot = {
+        projectRoots: [],
+        projectlessRoots: [],
+        projectlessThreadIds: new Set<string>(),
+        activeWorkspaceRoots: new Set<string>(),
+        threadWorkspaceRootHints: new Map<string, string>(),
+      };
+      this.codexGlobalStateCache = {
+        loadedAt: Date.now(),
+        snapshot: empty,
+      };
+      return empty;
+    }
+
+    let parsed: Record<string, unknown> = {};
+    try {
+      parsed = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      parsed = {};
+    }
+
+    const stringArray = (value: unknown): string[] => (
+      Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0) : []
+    );
+    const atomState = (parsed['electron-persisted-atom-state'] ?? {}) as Record<string, unknown>;
+    const projectRoots = uniqueStrings([
+      ...stringArray(parsed['project-order']),
+      ...stringArray(parsed['active-workspace-roots']),
+      ...stringArray(parsed['electron-saved-workspace-roots']),
+      ...stringArray(atomState['project-order']),
+      ...stringArray(atomState['active-workspace-roots']),
+      ...stringArray(atomState['electron-saved-workspace-roots']),
+    ]).filter((entry) => path.isAbsolute(entry));
+    const activeWorkspaceRoots = new Set<string>([
+      ...stringArray(parsed['active-workspace-roots']),
+      ...stringArray(atomState['active-workspace-roots']),
+    ].filter((entry) => path.isAbsolute(entry)));
+    const projectlessThreadIds = new Set<string>([
+      ...stringArray(parsed['projectless-thread-ids']),
+      ...stringArray(atomState['projectless-thread-ids']),
+    ]);
+
+    const rawHints = [
+      parsed['thread-workspace-root-hints'],
+      atomState['thread-workspace-root-hints'],
+    ].find((entry) => entry && typeof entry === 'object') as Record<string, unknown> | undefined;
+    const threadWorkspaceRootHints = new Map<string, string>();
+    if (rawHints) {
+      for (const [sessionId, rootPath] of Object.entries(rawHints)) {
+        if (typeof rootPath === 'string' && path.isAbsolute(rootPath)) {
+          threadWorkspaceRootHints.set(sessionId, rootPath);
+        }
+      }
+    }
+
+    const projectlessRoots = uniqueStrings(
+      Array.from(projectlessThreadIds)
+        .map((sessionId) => threadWorkspaceRootHints.get(sessionId) || '')
+        .filter((rootPath) => path.isAbsolute(rootPath)),
+    ).filter((rootPath) => !projectRoots.includes(rootPath));
+
+    const snapshot: CodexGlobalStateSnapshot = {
+      projectRoots,
+      projectlessRoots,
+      projectlessThreadIds,
+      activeWorkspaceRoots,
+      threadWorkspaceRootHints,
+    };
+    this.codexGlobalStateCache = {
+      loadedAt: Date.now(),
+      snapshot,
+    };
+    return snapshot;
   }
 
   private parseLocalCodexThread(filePath: string, titleIndex?: Map<string, string>): LocalCodexThread | null {
@@ -778,10 +1006,22 @@ export class JsonFileStore implements BridgeStore {
     if (!latestUserPreview) return null;
     if (!isUsefulThreadListPreview(latestUserPreview)) return null;
 
+    const indexedTitle = titleIndex?.get(sdkSessionId) || '';
+    const title = indexedTitle || this.fallbackLocalThreadTitle(latestUserPreview, workingDirectory, lastActiveAt);
+    if (originator === 'codex-feishu') {
+      if (!indexedTitle) {
+        this.upsertCodexSessionIndexEntry(sdkSessionId, title);
+      }
+      const snapshot = this.loadCodexGlobalState();
+      if (!snapshot.threadWorkspaceRootHints.has(sdkSessionId)) {
+        this.syncCodexGlobalThreadState(sdkSessionId, workingDirectory);
+      }
+    }
+
     return {
       sdkSessionId,
       filePath,
-      title: titleIndex?.get(sdkSessionId) || this.defaultThreadTitle(sdkSessionId, workingDirectory),
+      title,
       workingDirectory,
       model,
       latestMessagePreview,
@@ -815,6 +1055,82 @@ export class JsonFileStore implements BridgeStore {
     return entries;
   }
 
+  private buildLocalThreadSummary(channelType: string, chatId: string, thread: LocalCodexThread): ThreadSummary {
+    const snapshot = this.loadCodexGlobalState();
+    return {
+      id: `local:${thread.sdkSessionId}`,
+      channelType,
+      chatId,
+      sessionId: '',
+      title: thread.title,
+      workingDirectory: thread.workingDirectory,
+      projectLabel: this.getProjectLabelForLocalThread(thread, snapshot),
+      model: thread.model,
+      createdAt: thread.lastActiveAt,
+      updatedAt: thread.lastActiveAt,
+      lastActiveAt: thread.lastActiveAt,
+      latestMessagePreview: thread.latestMessagePreview,
+      latestMessageRole: thread.latestMessageRole,
+      latestUserPreview: thread.latestUserPreview,
+      lastActiveLabel: formatThreadTimestamp(thread.lastActiveAt),
+      sdkSessionId: thread.sdkSessionId,
+      displayId: thread.sdkSessionId,
+      source: 'local',
+      importable: true,
+    };
+  }
+
+  private getProjectLabelForRoot(rootPath: string, snapshot: CodexGlobalStateSnapshot): string {
+    if (rootPath && snapshot.projectlessRoots.includes(rootPath)) {
+      if (snapshot.projectlessRoots.length > 1) {
+        return `聊天 ${snapshot.projectlessRoots.indexOf(rootPath) + 1}`;
+      }
+      return '聊天';
+    }
+    if (rootPath) {
+      return path.basename(rootPath) || rootPath;
+    }
+    return '聊天';
+  }
+
+  private getProjectLabelForLocalThread(thread: LocalCodexThread, snapshot: CodexGlobalStateSnapshot): string {
+    const rootPath = this.getProjectRootForLocalThread(thread, snapshot);
+    if (rootPath) {
+      return this.getProjectLabelForRoot(rootPath, snapshot);
+    }
+    return path.basename(thread.workingDirectory) || '聊天';
+  }
+
+  private getProjectLabelForWorkingDirectory(workingDirectory: string, snapshot: CodexGlobalStateSnapshot): string {
+    const rootPath = this.getProjectRootForWorkingDirectory(workingDirectory, snapshot);
+    if (rootPath) {
+      return this.getProjectLabelForRoot(rootPath, snapshot);
+    }
+    return path.basename(workingDirectory) || '聊天';
+  }
+
+  private getProjectRootForLocalThread(
+    thread: LocalCodexThread,
+    snapshot: CodexGlobalStateSnapshot,
+  ): string {
+    const hintedRoot = snapshot.threadWorkspaceRootHints.get(thread.sdkSessionId);
+    if (hintedRoot) {
+      return hintedRoot;
+    }
+    return snapshot.projectRoots.find((rootPath) => isPathWithinRoot(rootPath, thread.workingDirectory)) || '';
+  }
+
+  private getProjectRootForWorkingDirectory(
+    workingDirectory: string,
+    snapshot: CodexGlobalStateSnapshot,
+  ): string {
+    if (!workingDirectory) return '';
+    return [
+      ...snapshot.projectRoots,
+      ...snapshot.projectlessRoots,
+    ].find((rootPath) => isPathWithinRoot(rootPath, workingDirectory)) || '';
+  }
+
   private getSessionSdkSessionId(sessionId: string): string {
     const session = this.sessions.get(sessionId) as (BridgeSession & { sdk_session_id?: string }) | undefined;
     return session?.sdk_session_id || '';
@@ -825,6 +1141,9 @@ export class JsonFileStore implements BridgeStore {
     const binding = this.getChannelBinding(channelType, chatId);
     if (binding?.workingDirectory) {
       workdirs.add(binding.workingDirectory);
+    }
+    if (binding?.preferredWorkingDirectory) {
+      workdirs.add(binding.preferredWorkingDirectory);
     }
     for (const thread of this.threads.values()) {
       if (thread.channelType !== channelType || thread.chatId !== chatId) continue;
@@ -854,6 +1173,7 @@ export class JsonFileStore implements BridgeStore {
   }
 
   private buildManagedThreadSummary(record: ThreadRecord): ThreadSummary {
+    const snapshot = this.loadCodexGlobalState();
     const sdkSessionId = this.getSessionSdkSessionId(record.sessionId);
     const sourceSdkSessionId = this.getThreadSourceSdkSessionId(record);
     const fallback = sourceSdkSessionId ? this.getLocalCodexThreads().get(sourceSdkSessionId) || null : null;
@@ -887,6 +1207,7 @@ export class JsonFileStore implements BridgeStore {
       ...record,
       title: effectiveTitle,
       lastActiveAt: effectiveLastActiveAt,
+      projectLabel: this.getProjectLabelForWorkingDirectory(record.workingDirectory, snapshot),
       latestMessagePreview,
       latestMessageRole,
       latestUserPreview,
@@ -1184,6 +1505,12 @@ export class JsonFileStore implements BridgeStore {
 
   private listImportableLocalThreads(channelType: string, chatId: string): ThreadSummary[] {
     const workdirs = this.getRelevantChatWorkdirs(channelType, chatId);
+    const snapshot = this.loadCodexGlobalState();
+    const relevantRoots = new Set(
+      Array.from(workdirs)
+        .map((workdir) => this.getProjectRootForWorkingDirectory(workdir, snapshot))
+        .filter(Boolean),
+    );
     const importedSdkIds = new Set<string>();
     for (const thread of this.threads.values()) {
       if (thread.channelType !== channelType || thread.chatId !== chatId) continue;
@@ -1195,27 +1522,132 @@ export class JsonFileStore implements BridgeStore {
 
     return Array.from(this.getLocalCodexThreads().values())
       .filter((thread) => !importedSdkIds.has(thread.sdkSessionId))
-      .filter((thread) => workdirs.size === 0 || workdirs.has(thread.workingDirectory))
-      .map((thread) => ({
-        id: `local:${thread.sdkSessionId}`,
-        channelType,
-        chatId,
-        sessionId: '',
-        title: thread.title,
-        workingDirectory: thread.workingDirectory,
-        model: thread.model,
-        createdAt: thread.lastActiveAt,
-        updatedAt: thread.lastActiveAt,
-        lastActiveAt: thread.lastActiveAt,
-        latestMessagePreview: thread.latestMessagePreview,
-        latestMessageRole: thread.latestMessageRole,
-        latestUserPreview: thread.latestUserPreview,
-        lastActiveLabel: formatThreadTimestamp(thread.lastActiveAt),
-        sdkSessionId: thread.sdkSessionId,
-        displayId: thread.sdkSessionId,
-        source: 'local',
-        importable: true,
-      }));
+      .filter((thread) => {
+        if (workdirs.size === 0) {
+          return true;
+        }
+        if (workdirs.has(thread.workingDirectory)) {
+          return true;
+        }
+        const threadRoot = this.getProjectRootForLocalThread(thread, snapshot);
+        return !!threadRoot && relevantRoots.has(threadRoot);
+      })
+      .map((thread) => this.buildLocalThreadSummary(channelType, chatId, thread));
+  }
+
+  getDefaultChatRoot(): string {
+    const snapshot = this.loadCodexGlobalState();
+    return snapshot.projectlessRoots[0] || '';
+  }
+
+  listCodexProjects(): ProjectSummary[] {
+    const snapshot = this.loadCodexGlobalState();
+    const localThreads = Array.from(this.getLocalCodexThreads().values());
+    const roots = [
+      ...snapshot.projectlessRoots.map((rootPath) => ({ rootPath, kind: 'chat-root' as const })),
+      ...snapshot.projectRoots.map((rootPath) => ({ rootPath, kind: 'project' as const })),
+    ];
+
+    return roots.map(({ rootPath, kind }, index) => {
+      const matchingThreads = localThreads.filter((thread) => this.getProjectRootForLocalThread(thread, snapshot) === rootPath);
+      const latestThread = matchingThreads
+        .slice()
+        .sort((a, b) => b.lastActiveAt.localeCompare(a.lastActiveAt))[0];
+      const displayName = kind === 'chat-root'
+        ? (snapshot.projectlessRoots.length > 1 ? `聊天 ${index + 1}` : '聊天')
+        : (path.basename(rootPath) || rootPath);
+      return {
+        rootPath,
+        displayName,
+        pathLabel: rootPath,
+        threadCount: matchingThreads.length,
+        lastActiveLabel: latestThread ? formatThreadTimestamp(latestThread.lastActiveAt) : '',
+        latestThreadTitle: latestThread?.title || '',
+        active: kind === 'project' && snapshot.activeWorkspaceRoots.has(rootPath),
+        kind,
+      };
+    });
+  }
+
+  findCodexProject(identifier: string): ProjectSummary | null {
+    const projects = this.listCodexProjects();
+    const normalized = identifier.trim();
+    if (!normalized) return null;
+
+    if (/^\d+$/.test(normalized)) {
+      const index = Number.parseInt(normalized, 10) - 1;
+      return projects[index] ?? null;
+    }
+
+    const exact = projects.find((project) =>
+      project.rootPath === normalized
+      || project.displayName === normalized,
+    );
+    if (exact) return exact;
+
+    const lower = normalized.toLowerCase();
+    const exactLower = projects.find((project) =>
+      project.rootPath.toLowerCase() === lower
+      || project.displayName.toLowerCase() === lower,
+    );
+    if (exactLower) return exactLower;
+
+    const matches = projects.filter((project) =>
+      project.displayName.toLowerCase().includes(lower)
+      || project.rootPath.toLowerCase().includes(lower),
+    );
+    return matches.length === 1 ? matches[0] : null;
+  }
+
+  listProjectThreads(channelType: string, chatId: string, projectRoot: string): ThreadSummary[] {
+    const snapshot = this.loadCodexGlobalState();
+    const managed = Array.from(this.threads.values())
+      .filter((thread) => thread.channelType === channelType && thread.chatId === chatId)
+      .filter((thread) => this.getProjectRootForWorkingDirectory(thread.workingDirectory, snapshot) === projectRoot)
+      .map((thread) => this.buildManagedThreadSummary(thread));
+
+    const importedSdkIds = new Set(
+      managed
+        .map((thread) => this.getThreadSourceSdkSessionId(thread))
+        .filter(Boolean),
+    );
+
+    const local = Array.from(this.getLocalCodexThreads().values())
+      .filter((thread) => !importedSdkIds.has(thread.sdkSessionId))
+      .filter((thread) => this.getProjectRootForLocalThread(thread, snapshot) === projectRoot)
+      .map((thread) => this.buildLocalThreadSummary(channelType, chatId, thread));
+
+    return [...managed, ...local]
+      .sort((a, b) => {
+        if (a.lastActiveAt === b.lastActiveAt) {
+          return b.createdAt.localeCompare(a.createdAt);
+        }
+        return b.lastActiveAt.localeCompare(a.lastActiveAt);
+      });
+  }
+
+  private findLocalThread(identifier: string): LocalCodexThread | null {
+    const normalized = identifier.trim();
+    if (!normalized) return null;
+
+    const exact = Array.from(this.getLocalCodexThreads().values()).find((thread) =>
+      thread.sdkSessionId === normalized
+      || thread.title === normalized,
+    );
+    if (exact) return exact;
+
+    const lower = normalized.toLowerCase();
+    const exactLower = Array.from(this.getLocalCodexThreads().values()).find((thread) =>
+      thread.sdkSessionId.toLowerCase() === lower
+      || thread.title.toLowerCase() === lower,
+    );
+    if (exactLower) return exactLower;
+
+    const matches = Array.from(this.getLocalCodexThreads().values()).filter((thread) =>
+      thread.sdkSessionId.toLowerCase().startsWith(lower)
+      || thread.title.toLowerCase().includes(lower),
+    );
+    return matches.length === 1 ? matches[0] : null;
   }
 
   private findManagedThreadBySdkSessionId(
@@ -1290,6 +1722,9 @@ export class JsonFileStore implements BridgeStore {
         codepilotSessionId: data.codepilotSessionId,
         sdkSessionId: (data as { sdkSessionId?: string }).sdkSessionId ?? '',
         workingDirectory: data.workingDirectory,
+        preferredWorkingDirectory: data.preferredWorkingDirectory
+          ?? existing.preferredWorkingDirectory
+          ?? data.workingDirectory,
         model: data.model,
         updatedAt: now(),
       };
@@ -1308,6 +1743,7 @@ export class JsonFileStore implements BridgeStore {
       codepilotSessionId: data.codepilotSessionId,
       sdkSessionId: (data as { sdkSessionId?: string }).sdkSessionId ?? '',
       workingDirectory: data.workingDirectory,
+      preferredWorkingDirectory: data.preferredWorkingDirectory ?? data.workingDirectory,
       model: data.model,
       mode: (this.settings.get('default_mode') as 'code' | 'plan' | 'ask') || 'code',
       active: true,
@@ -1505,6 +1941,11 @@ export class JsonFileStore implements BridgeStore {
     );
     if (matches.length === 1) return matches[0];
 
+    const local = this.findLocalThread(normalized);
+    if (local) {
+      return this.buildLocalThreadSummary(channelType, chatId, local);
+    }
+
     return null;
   }
 
@@ -1560,6 +2001,25 @@ export class JsonFileStore implements BridgeStore {
     const record = this.threads.get(this.threadKey(channelType, chatId, sessionId));
     if (!record) return null;
     return this.buildManagedThreadSummary(record);
+  }
+
+  syncBridgeThreadFromLocal(sessionId: string): void {
+    const record = this.findThreadRecordBySessionId(sessionId);
+    if (!record) return;
+
+    const sdkSessionId = this.getSessionSdkSessionId(sessionId);
+    if (!sdkSessionId) return;
+
+    this.localCodexThreadCache = null;
+    const local = this.getLocalCodexThreads().get(sdkSessionId);
+    if (!local) return;
+
+    this.upsertThreadRecord(record.channelType, record.chatId, sessionId, {
+      title: local.title,
+      workingDirectory: local.workingDirectory,
+      model: local.model,
+      touch: false,
+    });
   }
 
   getThreadLatestDialogue(sessionId: string): ThreadDialogue | null {

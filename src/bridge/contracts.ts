@@ -50,6 +50,7 @@ export interface ChannelBinding {
   codepilotSessionId: string;
   sdkSessionId: string;
   workingDirectory: string;
+  preferredWorkingDirectory?: string;
   model: string;
   mode: BridgeMode;
   active: boolean;
@@ -95,6 +96,7 @@ export interface UpsertChannelBindingInput {
   chatId: string;
   codepilotSessionId: string;
   workingDirectory: string;
+  preferredWorkingDirectory?: string;
   model: string;
 }
 
@@ -213,6 +215,7 @@ export interface ThreadSummary {
   displayId: string;
   title: string;
   workingDirectory: string;
+  projectLabel: string;
   model: string;
   latestMessagePreview: string;
   latestMessageRole: string;
@@ -222,9 +225,36 @@ export interface ThreadSummary {
   importable: boolean;
 }
 
+export interface ProjectSummary {
+  rootPath: string;
+  displayName: string;
+  pathLabel: string;
+  threadCount: number;
+  lastActiveLabel: string;
+  latestThreadTitle: string;
+  active: boolean;
+  kind: 'project' | 'chat-root';
+}
+
 export interface ThreadDialogue {
   userText: string;
   assistantText: string;
+}
+
+export interface ThreadPickerAction {
+  label: string;
+  callbackData: string;
+  style?: 'default' | 'primary' | 'danger';
+  disabled?: boolean;
+}
+
+export interface ThreadPickerOptions {
+  title?: string;
+  subtitle?: string;
+  maxItems?: number;
+  inlineRows?: boolean;
+  includeProjectLabel?: boolean;
+  actions?: ThreadPickerAction[];
 }
 
 export interface BridgeAdapter {
@@ -242,7 +272,9 @@ export interface BridgeAdapter {
     threads: ThreadSummary[],
     currentSessionId: string,
     replyToMessageId?: string,
+    options?: ThreadPickerOptions,
   ): Promise<SendResult>;
+  sendProjectPicker(chatId: string, projects: ProjectSummary[], replyToMessageId?: string): Promise<SendResult>;
   sendCommandReply(chatId: string, text: string, replyToMessageId?: string): Promise<void>;
   beginResponse(chatId: string, replyToMessageId?: string): void;
   updateResponse(chatId: string, fullText: string, tools: ToolProgress[]): void;

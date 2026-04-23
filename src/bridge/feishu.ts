@@ -9,13 +9,16 @@ import type {
   BridgeAdapter,
   FileAttachment,
   InboundMessage,
+  ProjectSummary,
   SendResult,
+  ThreadPickerOptions,
   ThreadSummary,
   ToolProgress,
 } from './contracts.js';
 import {
   buildMarkdownCard,
   buildPermissionCard,
+  buildProjectPickerCard,
   buildPostContent,
   buildStreamingCard,
   buildThreadPickerCard,
@@ -25,6 +28,7 @@ import {
   htmlToMarkdown,
   isImagePath,
   preprocessMarkdown,
+  renderProjectListText,
   renderThreadListText,
 } from './format.js';
 
@@ -268,11 +272,19 @@ export class FeishuAdapter implements BridgeAdapter {
     threads: ThreadSummary[],
     currentSessionId: string,
     replyToMessageId?: string,
+    options?: ThreadPickerOptions,
   ): Promise<SendResult> {
-    const cardJson = buildThreadPickerCard(threads, currentSessionId);
+    const cardJson = buildThreadPickerCard(threads, currentSessionId, options);
     const result = await this.sendInteractiveCard(chatId, cardJson, replyToMessageId);
     if (result.ok) return result;
-    return this.sendText(chatId, renderThreadListText(threads, currentSessionId), replyToMessageId);
+    return this.sendText(chatId, renderThreadListText(threads, currentSessionId, options), replyToMessageId);
+  }
+
+  async sendProjectPicker(chatId: string, projects: ProjectSummary[], replyToMessageId?: string): Promise<SendResult> {
+    const cardJson = buildProjectPickerCard(projects);
+    const result = await this.sendInteractiveCard(chatId, cardJson, replyToMessageId);
+    if (result.ok) return result;
+    return this.sendText(chatId, renderProjectListText(projects), replyToMessageId);
   }
 
   beginResponse(chatId: string, replyToMessageId?: string): void {

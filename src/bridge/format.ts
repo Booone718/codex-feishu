@@ -1,11 +1,24 @@
 import path from 'node:path';
-import type { ThreadSummary, ToolProgress } from './contracts.js';
+import type {
+  ProjectSummary,
+  ThreadPickerAction,
+  ThreadPickerOptions,
+  ThreadSummary,
+  ToolProgress,
+} from './contracts.js';
 
 const MARKDOWN_IMAGE_REF_RE = /!\[([^\]]*)\]\((\/[^)\s]+)\)/g;
 const MARKDOWN_LINK_REF_RE = /\[([^\]]+)\]\((\/[^)\s]+)\)/g;
 const ABSOLUTE_PATH_RE = /(^|[\s(])((?:\/Users|\/tmp|\/private\/var\/folders|\/var\/folders)\/[^\s)<>\]]+)/g;
 const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|tiff?|ico)$/i;
 const STREAMING_PREVIEW_MAX_CHARS = 7000;
+const THREAD_PICKER_MAX_ITEMS = 5;
+const THREAD_TITLE_MAX_CHARS = 38;
+const THREAD_INLINE_TITLE_MAX_CHARS = 28;
+const THREAD_INLINE_TITLE_FONT_SIZE = 18;
+const THREAD_INLINE_META_FONT_SIZE = 16;
+const THREAD_PATH_SEGMENTS = 3;
+const PROJECT_PICKER_MAX_ITEMS = 8;
 
 export function hasComplexMarkdown(text: string): boolean {
   return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
@@ -116,6 +129,80 @@ function compactPreview(text: string, maxChars: number): string {
   return `${notice}\n\n${visible}`;
 }
 
+function estimateDisplayWidth(text: string): number {
+  let width = 0;
+  for (const char of text) {
+    width += /[\u0020-\u007e]/.test(char) ? 1 : 2;
+  }
+  return width;
+}
+
+function truncateSingleLine(text: string, maxChars: number): string {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+  if (estimateDisplayWidth(normalized) <= maxChars) return normalized;
+
+  const ellipsis = '…';
+  const budget = Math.max(1, maxChars - estimateDisplayWidth(ellipsis));
+  let width = 0;
+  let visible = '';
+  for (const char of normalized) {
+    const nextWidth = width + estimateDisplayWidth(char);
+    if (nextWidth > budget) break;
+    visible += char;
+    width = nextWidth;
+  }
+  return `${visible.trimEnd()}${ellipsis}`;
+}
+
+function compactPathLabel(rawPath: string): string {
+  const normalized = rawPath.trim();
+  if (!normalized || normalized === '~') return normalized || '~';
+  const parts = normalized.split('/').filter(Boolean);
+  if (parts.length === 0) return normalized;
+  if (parts.length <= THREAD_PATH_SEGMENTS) return normalized;
+  return `…/${parts.slice(-THREAD_PATH_SEGMENTS).join('/')}`;
+}
+
+function compactThreadScopeLabel(rawPath: string): string {
+  const normalized = (path.basename(rawPath) || rawPath).trim();
+  if (!normalized) return '';
+  if (normalized.length <= 18) return normalized;
+
+  const withoutDatePrefix = normalized.replace(/^\d{4}-\d{2}-\d{2}-/, '');
+  if (withoutDatePrefix.length <= 18) {
+    return withoutDatePrefix;
+  }
+
+  const parts = withoutDatePrefix.split('-').filter(Boolean);
+  if (parts.length >= 2) {
+    const lastTwo = parts.slice(-2).join('-');
+    if (lastTwo.length <= 18) {
+      return lastTwo;
+    }
+  }
+  if (parts.length >= 1) {
+    const last = parts[parts.length - 1];
+    if (last.length <= 18) {
+      return last;
+    }
+  }
+
+  return truncateSingleLine(withoutDatePrefix, 18);
+}
+
+function normalizeThreadLabel(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, '');
+}
+
+function shouldShowThreadScopeLabel(title: string, scopeLabel: string): boolean {
+  if (!scopeLabel) return false;
+  const normalizedTitle = normalizeThreadLabel(title);
+  const normalizedScope = normalizeThreadLabel(scopeLabel);
+  if (!normalizedTitle || !normalizedScope) return true;
+  return !normalizedTitle.includes(normalizedScope);
+}
+
 export function buildStreamingCard(text: string, tools: ToolProgress[], options?: {
   thinking?: boolean;
   status?: string;
@@ -182,34 +269,77 @@ export function buildPermissionCard(body: string, permissionId: string): string 
   });
 }
 
-export function buildThreadPickerCard(threads: ThreadSummary[], currentSessionId: string): string {
-  const elements: Array<Record<string, unknown>> = [
-    {
-      tag: 'div',
-      text: {
-        tag: 'lark_md',
-        content: threads.length === 0
-          ? '当前没有可切换的线程。'
-          : '选择一个线程继续对话。也可以继续使用 `线程列表` 或 `切换线程 2`。',
-      },
-    },
+function buildActionElements(actions: ThreadPickerAction[]): Array<Record<string, unknown>> {
+  if (actions.length === 0) {
+    return [];
+  }
+  return [
     {
       tag: 'action',
-      actions: [
-        {
-          tag: 'button',
-          text: { tag: 'plain_text', content: '刷新列表' },
-          type: 'default',
-          value: { callback_data: 'thread:list' },
-        },
-        {
-          tag: 'button',
-          text: { tag: 'plain_text', content: '新线程' },
-          type: 'primary',
-          value: { callback_data: 'thread:new' },
-        },
-      ],
+      actions: actions.map((action) => ({
+        tag: 'button',
+        text: { tag: 'plain_text', content: action.label },
+        type: action.style || 'default',
+        disabled: action.disabled ?? false,
+        value: { callback_data: action.callbackData },
+      })),
     },
+  ];
+}
+
+function summarizeThreadMeta(
+  thread: ThreadSummary,
+  currentSessionId: string,
+  options?: {
+    showWorkdir?: boolean;
+    includeProjectLabel?: boolean;
+    includeCurrent?: boolean;
+  },
+): string {
+  const bits: string[] = [];
+  if ((options?.includeCurrent ?? true) && thread.sessionId === currentSessionId) {
+    bits.push('当前');
+  }
+  if (options?.includeProjectLabel && thread.projectLabel) {
+    bits.push(thread.projectLabel);
+  } else if (options?.showWorkdir && thread.workingDirectory) {
+    const scopeLabel = compactThreadScopeLabel(thread.workingDirectory);
+    if (shouldShowThreadScopeLabel(thread.title, scopeLabel)) {
+      bits.push(scopeLabel);
+    }
+  }
+  if (thread.lastActiveLabel) {
+    bits.push(thread.lastActiveLabel);
+  }
+  return bits.join(' · ');
+}
+
+export function buildThreadPickerCard(
+  threads: ThreadSummary[],
+  currentSessionId: string,
+  options?: ThreadPickerOptions,
+): string {
+  const visibleThreads = threads.slice(0, options?.maxItems ?? THREAD_PICKER_MAX_ITEMS);
+  const actions = options?.actions ?? [
+    { label: '项目', callbackData: 'project:list', style: 'default' as const },
+    { label: '新线程', callbackData: 'thread:new', style: 'primary' as const },
+  ];
+  const showWorkdir = !options?.inlineRows
+    && new Set(visibleThreads.map((thread) => thread.workingDirectory).filter(Boolean)).size > 1;
+  const introText = threads.length === 0
+    ? (options?.subtitle || '当前没有可切换的线程。')
+    : options?.subtitle;
+  const elements: Array<Record<string, unknown>> = [
+    ...(introText
+      ? [{
+          tag: 'div',
+          text: {
+            tag: 'lark_md',
+            content: introText,
+          },
+        } satisfies Record<string, unknown>]
+      : []),
+    ...buildActionElements(actions),
   ];
 
   if (threads.length === 0) {
@@ -217,47 +347,89 @@ export function buildThreadPickerCard(threads: ThreadSummary[], currentSessionId
       config: { wide_screen_mode: true },
       header: {
         template: 'blue',
-        title: { tag: 'plain_text', content: 'Threads' },
+        title: { tag: 'plain_text', content: options?.title || '最近线程' },
       },
       elements,
     });
   }
 
-  for (const [index, thread] of threads.slice(0, 8).entries()) {
-    const preview = thread.latestUserPreview || thread.latestMessagePreview || '';
-    const title = thread.title || `${thread.displayId.slice(0, 8)}...`;
-    const previewLine = preview && preview !== title ? `\n${preview}` : '';
-    const meta = [
-      `ID ${thread.displayId.slice(0, 8)}...`,
-      thread.workingDirectory || '~',
-      thread.lastActiveLabel,
-      thread.source === 'local' ? 'local' : 'managed',
-      thread.sessionId === currentSessionId ? 'current' : '',
-    ].filter(Boolean).join(' | ');
-
-    elements.push(
-      {
-        tag: 'div',
-        text: {
-          tag: 'lark_md',
-          content: `**${index + 1}. ${title}**${previewLine}\n${meta}`,
-        },
-      },
-      {
-        tag: 'action',
-        actions: [
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: thread.sessionId === currentSessionId ? 'Current' : 'Switch' },
-            type: thread.sessionId === currentSessionId ? 'default' : 'primary',
-            disabled: thread.sessionId === currentSessionId,
-            value: { callback_data: `thread:switch:${thread.displayId}` },
-          },
-        ],
-      },
+  for (const [index, thread] of visibleThreads.entries()) {
+    const title = truncateSingleLine(
+      thread.title || `${thread.displayId.slice(0, 8)}...`,
+      options?.inlineRows ? THREAD_INLINE_TITLE_MAX_CHARS : THREAD_TITLE_MAX_CHARS,
     );
+    const meta = summarizeThreadMeta(thread, currentSessionId, {
+      showWorkdir,
+      includeProjectLabel: options?.includeProjectLabel,
+      includeCurrent: !options?.inlineRows,
+    });
+    const button = {
+      tag: 'button',
+      text: { tag: 'plain_text', content: thread.sessionId === currentSessionId ? '当前' : '切换' },
+      type: thread.sessionId === currentSessionId ? 'default' : 'primary',
+      disabled: thread.sessionId === currentSessionId,
+      value: { callback_data: `thread:switch:${thread.displayId}` },
+    } as const;
 
-    if (index < Math.min(threads.length, 8) - 1) {
+    if (options?.inlineRows) {
+      elements.push(
+        {
+          tag: 'div',
+          text: {
+            tag: 'lark_md',
+            content: `**${index + 1}. ${title}**`,
+            font_size: THREAD_INLINE_TITLE_FONT_SIZE,
+          },
+        },
+        {
+          tag: 'column_set',
+          flex_mode: 'none',
+          horizontal_spacing: '8px',
+          columns: [
+            {
+              tag: 'column',
+              width: 'weighted',
+              weight: 7,
+              vertical_align: 'center',
+              elements: [
+                {
+                  tag: 'div',
+                  text: {
+                    tag: 'lark_md',
+                    content: meta || ' ',
+                    font_size: THREAD_INLINE_META_FONT_SIZE,
+                  },
+                },
+              ],
+            },
+            {
+              tag: 'column',
+              width: 'auto',
+              vertical_align: 'center',
+              elements: [button],
+            },
+          ],
+        },
+      );
+    } else {
+      elements.push(
+        {
+          tag: 'div',
+          text: {
+            tag: 'lark_md',
+            content: meta
+              ? `**${index + 1}. ${title}**\n${meta}`
+              : `**${index + 1}. ${title}**`,
+          },
+        },
+        {
+          tag: 'action',
+          actions: [button],
+        },
+      );
+    }
+
+    if (index < visibleThreads.length - 1) {
       elements.push({ tag: 'hr' });
     }
   }
@@ -266,33 +438,145 @@ export function buildThreadPickerCard(threads: ThreadSummary[], currentSessionId
     config: { wide_screen_mode: true },
     header: {
       template: 'blue',
-      title: { tag: 'plain_text', content: 'Threads' },
+      title: { tag: 'plain_text', content: options?.title || '最近线程' },
     },
     elements,
   });
 }
 
-export function renderThreadListText(threads: ThreadSummary[], currentSessionId: string): string {
+export function renderThreadListText(
+  threads: ThreadSummary[],
+  currentSessionId: string,
+  options?: ThreadPickerOptions,
+): string {
   if (threads.length === 0) {
-    return 'Threads\n\nNo threads found.';
+    return `${options?.title || '最近线程'}\n\n${options?.subtitle || '当前没有线程。'}`;
   }
 
-  const lines = ['Threads', ''];
-  for (const [index, thread] of threads.entries()) {
+  const visibleThreads = threads.slice(0, options?.maxItems ?? THREAD_PICKER_MAX_ITEMS);
+  const showWorkdir = new Set(visibleThreads.map((thread) => thread.workingDirectory).filter(Boolean)).size > 1;
+  const lines = [options?.title || '最近线程'];
+  if (options?.subtitle) {
+    lines.push('', options.subtitle);
+  }
+  for (const [index, thread] of visibleThreads.entries()) {
     const current = thread.sessionId === currentSessionId ? ' [current]' : '';
-    const title = thread.title || `${thread.displayId.slice(0, 8)}...`;
+    const title = truncateSingleLine(thread.title || `${thread.displayId.slice(0, 8)}...`, THREAD_TITLE_MAX_CHARS);
+    lines.push('');
     lines.push(`${index + 1}. ${title}${current}`);
-    lines.push(`ID: ${thread.displayId.slice(0, 8)}...`);
-    if (thread.latestUserPreview) {
-      lines.push(`最近对话: ${thread.latestUserPreview}`);
+    const meta = summarizeThreadMeta(thread, currentSessionId, {
+      showWorkdir,
+      includeProjectLabel: options?.includeProjectLabel,
+      includeCurrent: true,
+    });
+    if (meta) {
+      lines.push(meta);
     }
-    if (thread.latestMessagePreview && thread.latestMessagePreview !== thread.latestUserPreview) {
-      lines.push(`最近消息: ${thread.latestMessagePreview}`);
+  }
+  if (threads.length > visibleThreads.length) {
+    lines.push('', `仅显示最近 ${visibleThreads.length} 个线程。`);
+  }
+  lines.push('', '切换: 切换线程 2');
+  return lines.join('\n');
+}
+
+export function buildProjectPickerCard(projects: ProjectSummary[]): string {
+  const visibleProjects = projects.slice(0, PROJECT_PICKER_MAX_ITEMS);
+  const elements: Array<Record<string, unknown>> = [
+    {
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content: projects.length === 0
+          ? '当前没有可用项目。'
+          : '选择一个 Codex 项目或聊天根层，查看最近线程或在该处新建线程。',
+      },
+    },
+  ];
+
+  if (projects.length === 0) {
+    return JSON.stringify({
+      config: { wide_screen_mode: true },
+      header: {
+        template: 'blue',
+        title: { tag: 'plain_text', content: '项目' },
+      },
+      elements,
+    });
+  }
+
+  for (const [index, project] of visibleProjects.entries()) {
+    const meta = [
+      project.kind === 'chat-root' ? '聊天根层' : '',
+      project.threadCount > 0 ? `${project.threadCount} 条线程` : '暂无线程',
+      project.lastActiveLabel ? `最近 ${project.lastActiveLabel}` : '',
+      project.active ? '当前打开' : '',
+    ].filter(Boolean).join(' · ');
+
+    elements.push(
+      {
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content: `**${index + 1}. ${truncateSingleLine(project.displayName, 40)}**\n${meta}\n\`${compactPathLabel(project.pathLabel)}\``,
+        },
+      },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '查看线程' },
+            type: 'default',
+            value: { callback_data: `project:threads:${encodeURIComponent(project.rootPath)}` },
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '新建线程' },
+            type: 'primary',
+            value: { callback_data: `project:new:${encodeURIComponent(project.rootPath)}` },
+          },
+        ],
+      },
+    );
+
+    if (index < visibleProjects.length - 1) {
+      elements.push({ tag: 'hr' });
     }
-    lines.push(`${thread.workingDirectory || '~'} | 最近活跃 ${thread.lastActiveLabel}`);
+  }
+
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: {
+      template: 'blue',
+      title: { tag: 'plain_text', content: '项目' },
+    },
+    elements,
+  });
+}
+
+export function renderProjectListText(projects: ProjectSummary[]): string {
+  if (projects.length === 0) {
+    return '项目\n\n当前没有可用项目。';
+  }
+
+  const visibleProjects = projects.slice(0, PROJECT_PICKER_MAX_ITEMS);
+  const lines = ['项目', ''];
+  for (const [index, project] of visibleProjects.entries()) {
+    lines.push(`${index + 1}. ${project.displayName}${project.active ? ' [current]' : ''}`);
+    lines.push(compactPathLabel(project.pathLabel));
+    lines.push([
+      project.kind === 'chat-root' ? '聊天根层' : '',
+      project.threadCount > 0 ? `${project.threadCount} 条线程` : '暂无线程',
+    ].filter(Boolean).join(' · '));
+    if (project.lastActiveLabel) {
+      lines.push(`最近 ${project.lastActiveLabel}`);
+    }
     lines.push('');
   }
-  lines.push('切换: 切换线程 2');
+  lines.push('查看项目线程: /project threads 2');
+  lines.push('设为当前项目: /project use 2');
+  lines.push('在项目下新建: /project new 2');
   return lines.join('\n');
 }
 
