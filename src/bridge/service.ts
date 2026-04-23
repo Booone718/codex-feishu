@@ -19,6 +19,8 @@ const MAX_INPUT_LENGTH = 120_000;
 const THREAD_LIST_PAGE_SIZE = 5;
 const HAN_CHAR_RE = /\p{Script=Han}/u;
 const ENGLISH_WORD_RE = /[A-Za-z]{2,}/g;
+const PERMISSION_TEST_PROMPT =
+  'Run a harmless shell command that requires approval: create and then remove ~/.codex-feishu/.permtest-smoke . Do not do anything else.';
 
 function escapeHtml(value: string): string {
   return value
@@ -35,6 +37,10 @@ function normalizeText(value: string): string {
 
 function collapseWhitespace(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
+}
+
+function isInternalUiLanguagePrompt(value: string): boolean {
+  return collapseWhitespace(value) === collapseWhitespace(PERMISSION_TEST_PROMPT);
 }
 
 function truncateInlineValue(value: string, maxChars = 120): string {
@@ -906,11 +912,14 @@ export class FeishuBridgeService {
   }
 
   private currentUiLanguage(binding: ChannelBinding): UiLanguage {
+    if (binding.preferredLanguage) {
+      return binding.preferredLanguage;
+    }
     const recentLanguage = this.detectRecentUiLanguage(binding);
     if (recentLanguage) {
       return recentLanguage;
     }
-    return binding.preferredLanguage || getDefaultUiLanguage();
+    return getDefaultUiLanguage();
   }
 
   private detectRecentUiLanguage(binding: ChannelBinding): UiLanguage | null {
@@ -920,12 +929,16 @@ export class FeishuBridgeService {
       if (message.role !== 'user') {
         continue;
       }
+      if (isInternalUiLanguagePrompt(message.content)) {
+        continue;
+      }
       const recentLanguage = detectUiLanguageFromText(message.content);
       if (!recentLanguage) {
         continue;
       }
       if (binding.preferredLanguage !== recentLanguage) {
         this.store.updateChannelBinding(binding.id, { preferredLanguage: recentLanguage });
+        binding.preferredLanguage = recentLanguage;
       }
       return recentLanguage;
     }
@@ -933,17 +946,22 @@ export class FeishuBridgeService {
   }
 
   private rememberPreferredLanguage(binding: ChannelBinding, inputText: string): UiLanguage | null {
+    if (isInternalUiLanguagePrompt(inputText)) {
+      return null;
+    }
     const detected = detectUiLanguageFromText(inputText);
     if (!detected || binding.preferredLanguage === detected) {
       return detected;
     }
     this.store.updateChannelBinding(binding.id, { preferredLanguage: detected });
+    binding.preferredLanguage = detected;
     return detected;
   }
 
   private async runPermissionTest(message: InboundMessage, binding: ChannelBinding): Promise<void> {
     await this.handleConversationMessage(message, binding, {
-      promptOverride: 'Run a harmless shell command that requires approval: create and then remove ~/.codex-feishu/.permtest-smoke . Do not do anything else.',
+      promptOverride: PERMISSION_TEST_PROMPT,
+      savedPrompt: message.text,
       uiLanguage: this.currentUiLanguage(binding),
     });
   }
@@ -951,7 +969,7 @@ export class FeishuBridgeService {
   private async handleConversationMessage(
     message: InboundMessage,
     binding: ChannelBinding,
-    options?: { promptOverride?: string; uiLanguage?: UiLanguage },
+    options?: { promptOverride?: string; savedPrompt?: string; uiLanguage?: UiLanguage },
   ): Promise<void> {
     const mirrored = await this.maybeMirrorBusyThread(message, binding);
     if (mirrored) return;
@@ -984,6 +1002,7 @@ export class FeishuBridgeService {
       const result = await runConversation(this.store, this.llm, binding, prompt, {
         abortSignal: abortController.signal,
         files: message.attachments,
+        savedPrompt: options?.savedPrompt,
         callbacks: {
           onPartialText: (fullText) => {
             partialText = fullText;

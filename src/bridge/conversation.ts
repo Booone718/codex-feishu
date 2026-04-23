@@ -33,6 +33,7 @@ export async function runConversation(
   options?: {
     abortSignal?: AbortSignal;
     files?: FileAttachment[];
+    savedPrompt?: string;
     callbacks?: ConversationCallbacks;
   },
 ): Promise<ConversationResult> {
@@ -111,12 +112,13 @@ async function executeConversation(
   options?: {
     abortSignal?: AbortSignal;
     files?: FileAttachment[];
+    savedPrompt?: string;
     callbacks?: ConversationCallbacks;
   },
 ): Promise<ConversationResult> {
   const sessionId = binding.codepilotSessionId;
   const session = store.getSession(sessionId);
-  const savedPrompt = buildSavedPrompt(prompt, options?.files);
+  const savedPrompt = options?.savedPrompt ?? buildSavedPrompt(prompt, options?.files);
   store.addMessage(sessionId, 'user', savedPrompt);
 
   const recentMessages = store.getMessages(sessionId, { limit: 50 }).messages;
