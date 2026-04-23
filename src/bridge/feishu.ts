@@ -105,7 +105,7 @@ export class FeishuAdapter implements BridgeAdapter {
   readonly displayName = 'Feishu';
 
   private readonly seenMessageIds = new Map<string, true>();
-  private readonly typingReactions = new Map<string, string>();
+  private readonly typingReactions = new Map<string, { reactionId: string; messageId: string }>();
   private readonly lastIncomingMessageId = new Map<string, string>();
   private readonly activeCards = new Map<string, ActiveCardState>();
   private readonly cardCreates = new Map<string, Promise<boolean>>();
@@ -559,7 +559,9 @@ export class FeishuAdapter implements BridgeAdapter {
         data: { reaction_type: { emoji_type: TYPING_EMOJI } },
       });
       const reactionId = (res as { data?: { reaction_id?: string } })?.data?.reaction_id;
-      if (reactionId) this.typingReactions.set(chatId, reactionId);
+      if (reactionId) {
+        this.typingReactions.set(chatId, { reactionId, messageId });
+      }
     } catch {
       // non-critical
     }
@@ -567,13 +569,12 @@ export class FeishuAdapter implements BridgeAdapter {
 
   private async removeTypingReaction(chatId: string): Promise<void> {
     if (!this.restClient) return;
-    const reactionId = this.typingReactions.get(chatId);
-    const messageId = this.lastIncomingMessageId.get(chatId);
-    if (!reactionId || !messageId) return;
+    const entry = this.typingReactions.get(chatId);
+    if (!entry) return;
     this.typingReactions.delete(chatId);
     try {
       await this.restClient.im.messageReaction.delete({
-        path: { message_id: messageId, reaction_id: reactionId },
+        path: { message_id: entry.messageId, reaction_id: entry.reactionId },
       });
     } catch {
       // ignore
