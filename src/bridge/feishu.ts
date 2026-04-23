@@ -16,6 +16,7 @@ import type {
   ToolProgress,
 } from './contracts.js';
 import {
+  buildInfoCard,
   buildMarkdownCard,
   buildPermissionCard,
   buildProjectPickerCard,
@@ -33,6 +34,31 @@ import {
 } from './format.js';
 
 type InboundHandler = (message: InboundMessage) => Promise<void>;
+
+function extractCommandCardPayload(markdown: string): { title: string; body: string } {
+  const lines = markdown.split('\n');
+  const firstContentIndex = lines.findIndex((line) => line.trim().length > 0);
+  if (firstContentIndex < 0) {
+    return { title: 'Codex', body: ' ' };
+  }
+
+  const firstLine = lines[firstContentIndex].trim();
+  const headerMatch = /^\*\*(.+?)\*\*$/.exec(firstLine);
+  if (!headerMatch) {
+    return {
+      title: 'Codex',
+      body: markdown.trim() || ' ',
+    };
+  }
+
+  const bodyLines = [...lines];
+  bodyLines.splice(firstContentIndex, 1);
+  const body = bodyLines.join('\n').trim();
+  return {
+    title: headerMatch[1].trim() || 'Codex',
+    body: body || ' ',
+  };
+}
 
 type FeishuMessageEventData = {
   sender: {
@@ -147,6 +173,8 @@ export class FeishuAdapter implements BridgeAdapter {
       'im.message.receive_v1': async (data) => {
         await this.processIncomingEvent(data as FeishuMessageEventData);
       },
+      'im.message.reaction.created_v1': async () => {},
+      'im.message.reaction.deleted_v1': async () => {},
       'card.action.trigger': (async (data: unknown) => {
         return await this.processCardAction(data as Record<string, unknown>);
       }) as any,
@@ -280,6 +308,26 @@ export class FeishuAdapter implements BridgeAdapter {
     return this.sendText(chatId, renderThreadListText(threads, currentSessionId, options), replyToMessageId);
   }
 
+  async updateThreadPicker(
+    _chatId: string,
+    messageId: string,
+    threads: ThreadSummary[],
+    currentSessionId: string,
+    options?: ThreadPickerOptions,
+  ): Promise<boolean> {
+    if (!this.restClient) return false;
+    try {
+      await this.restClient.im.message.patch({
+        path: { message_id: messageId },
+        data: { content: buildThreadPickerCard(threads, currentSessionId, options) },
+      });
+      return true;
+    } catch (error) {
+      console.warn('[feishu] thread picker update failed:', error instanceof Error ? error.message : error);
+      return false;
+    }
+  }
+
   async sendProjectPicker(chatId: string, projects: ProjectSummary[], replyToMessageId?: string): Promise<SendResult> {
     const cardJson = buildProjectPickerCard(projects);
     const result = await this.sendInteractiveCard(chatId, cardJson, replyToMessageId);
@@ -374,7 +422,13 @@ export class FeishuAdapter implements BridgeAdapter {
   }
 
   async sendCommandReply(chatId: string, text: string, replyToMessageId?: string): Promise<void> {
-    await this.sendHtml(chatId, text, replyToMessageId);
+    const markdown = htmlToMarkdown(text);
+    const { title, body } = extractCommandCardPayload(markdown);
+    const result = await this.sendInteractiveCard(chatId, buildInfoCard(title, body), replyToMessageId);
+    if (result.ok) {
+      return;
+    }
+    await this.sendMarkdown(chatId, markdown, replyToMessageId);
   }
 
   private async sendInteractiveCard(chatId: string, content: string, replyToMessageId?: string): Promise<SendResult> {

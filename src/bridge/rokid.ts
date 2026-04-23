@@ -245,6 +245,17 @@ export class RokidAdapter implements BridgeAdapter {
     return this.sendText(chatId, renderThreadListText(threads, currentSessionId, options), replyToMessageId);
   }
 
+  async updateThreadPicker(
+    chatId: string,
+    _messageId: string,
+    threads: ThreadSummary[],
+    currentSessionId: string,
+    options?: ThreadPickerOptions,
+  ): Promise<boolean> {
+    const result = await this.sendThreadPicker(chatId, threads, currentSessionId, undefined, options);
+    return result.ok;
+  }
+
   async sendProjectPicker(chatId: string, projects: ProjectSummary[], replyToMessageId?: string): Promise<SendResult> {
     return this.sendText(chatId, renderProjectListText(projects), replyToMessageId);
   }

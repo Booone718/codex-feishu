@@ -251,10 +251,12 @@ export interface ThreadPickerAction {
 export interface ThreadPickerOptions {
   title?: string;
   subtitle?: string;
+  startIndex?: number;
   maxItems?: number;
   inlineRows?: boolean;
   includeProjectLabel?: boolean;
   actions?: ThreadPickerAction[];
+  loadMoreCallbackData?: string;
 }
 
 export interface BridgeAdapter {
@@ -274,6 +276,13 @@ export interface BridgeAdapter {
     replyToMessageId?: string,
     options?: ThreadPickerOptions,
   ): Promise<SendResult>;
+  updateThreadPicker?(
+    chatId: string,
+    messageId: string,
+    threads: ThreadSummary[],
+    currentSessionId: string,
+    options?: ThreadPickerOptions,
+  ): Promise<boolean>;
   sendProjectPicker(chatId: string, projects: ProjectSummary[], replyToMessageId?: string): Promise<SendResult>;
   sendCommandReply(chatId: string, text: string, replyToMessageId?: string): Promise<void>;
   beginResponse(chatId: string, replyToMessageId?: string): void;

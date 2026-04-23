@@ -19,6 +19,10 @@ const THREAD_INLINE_TITLE_FONT_SIZE = 18;
 const THREAD_INLINE_META_FONT_SIZE = 16;
 const THREAD_PATH_SEGMENTS = 3;
 const PROJECT_PICKER_MAX_ITEMS = 8;
+const PROJECT_TITLE_MAX_CHARS = 28;
+const PROJECT_TITLE_FONT_SIZE = 18;
+const PROJECT_META_FONT_SIZE = 14;
+const PROJECT_PATH_FONT_SIZE = 13;
 
 export function hasComplexMarkdown(text: string): boolean {
   return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
@@ -68,6 +72,25 @@ export function buildMarkdownCard(text: string, title?: string, template = 'blue
     body: {
       elements: [{ tag: 'markdown', content: text }],
     },
+  });
+}
+
+export function buildInfoCard(title: string, body: string, template = 'blue'): string {
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: {
+      template,
+      title: { tag: 'plain_text', content: title },
+    },
+    elements: [
+      {
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content: body || ' ',
+        },
+      },
+    ],
   });
 }
 
@@ -158,6 +181,14 @@ function truncateSingleLine(text: string, maxChars: number): string {
 function compactPathLabel(rawPath: string): string {
   const normalized = rawPath.trim();
   if (!normalized || normalized === '~') return normalized || '~';
+  const homeRelative = normalized.replace(/^\/Users\/[^/]+\//, '~/');
+  if (homeRelative.startsWith('~/')) {
+    const parts = homeRelative.slice(2).split('/').filter(Boolean);
+    if (parts.length <= 2) {
+      return `~/${parts.join('/')}`;
+    }
+    return `~/…/${parts.slice(-2).join('/')}`;
+  }
   const parts = normalized.split('/').filter(Boolean);
   if (parts.length === 0) return normalized;
   if (parts.length <= THREAD_PATH_SEGMENTS) return normalized;
@@ -193,6 +224,10 @@ function compactThreadScopeLabel(rawPath: string): string {
 
 function normalizeThreadLabel(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, '');
+}
+
+function compactProjectLabel(label: string): string {
+  return compactThreadScopeLabel(label);
 }
 
 function shouldShowThreadScopeLabel(title: string, scopeLabel: string): boolean {
@@ -273,6 +308,29 @@ function buildActionElements(actions: ThreadPickerAction[]): Array<Record<string
   if (actions.length === 0) {
     return [];
   }
+  if (actions.length === 2) {
+    return [
+      {
+        tag: 'column_set',
+        flex_mode: 'none',
+        horizontal_spacing: '8px',
+        columns: actions.map((action) => ({
+          tag: 'column',
+          width: 'auto',
+          vertical_align: 'center',
+          elements: [
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content: action.label },
+              type: action.style || 'default',
+              disabled: action.disabled ?? false,
+              value: { callback_data: action.callbackData },
+            },
+          ],
+        })),
+      },
+    ];
+  }
   return [
     {
       tag: 'action',
@@ -301,7 +359,7 @@ function summarizeThreadMeta(
     bits.push('当前');
   }
   if (options?.includeProjectLabel && thread.projectLabel) {
-    bits.push(thread.projectLabel);
+    bits.push(compactProjectLabel(thread.projectLabel));
   } else if (options?.showWorkdir && thread.workingDirectory) {
     const scopeLabel = compactThreadScopeLabel(thread.workingDirectory);
     if (shouldShowThreadScopeLabel(thread.title, scopeLabel)) {
@@ -319,7 +377,11 @@ export function buildThreadPickerCard(
   currentSessionId: string,
   options?: ThreadPickerOptions,
 ): string {
-  const visibleThreads = threads.slice(0, options?.maxItems ?? THREAD_PICKER_MAX_ITEMS);
+  const startIndex = Math.max(0, Math.trunc(options?.startIndex ?? 0));
+  const visibleThreads = threads.slice(
+    startIndex,
+    startIndex + (options?.maxItems ?? THREAD_PICKER_MAX_ITEMS),
+  );
   const actions = options?.actions ?? [
     { label: '项目', callbackData: 'project:list', style: 'default' as const },
     { label: '新线程', callbackData: 'thread:new', style: 'primary' as const },
@@ -344,7 +406,7 @@ export function buildThreadPickerCard(
 
   if (threads.length === 0) {
     return JSON.stringify({
-      config: { wide_screen_mode: true },
+      config: { wide_screen_mode: false },
       header: {
         template: 'blue',
         title: { tag: 'plain_text', content: options?.title || '最近线程' },
@@ -354,6 +416,7 @@ export function buildThreadPickerCard(
   }
 
   for (const [index, thread] of visibleThreads.entries()) {
+    const displayIndex = startIndex + index + 1;
     const title = truncateSingleLine(
       thread.title || `${thread.displayId.slice(0, 8)}...`,
       options?.inlineRows ? THREAD_INLINE_TITLE_MAX_CHARS : THREAD_TITLE_MAX_CHARS,
@@ -372,45 +435,43 @@ export function buildThreadPickerCard(
     } as const;
 
     if (options?.inlineRows) {
-      elements.push(
-        {
-          tag: 'div',
-          text: {
-            tag: 'lark_md',
-            content: `**${index + 1}. ${title}**`,
-            font_size: THREAD_INLINE_TITLE_FONT_SIZE,
-          },
-        },
-        {
-          tag: 'column_set',
-          flex_mode: 'none',
-          horizontal_spacing: '8px',
-          columns: [
-            {
-              tag: 'column',
-              width: 'weighted',
-              weight: 7,
-              vertical_align: 'center',
-              elements: [
-                {
-                  tag: 'div',
-                  text: {
-                    tag: 'lark_md',
-                    content: meta || ' ',
-                    font_size: THREAD_INLINE_META_FONT_SIZE,
-                  },
+      elements.push({
+        tag: 'column_set',
+        flex_mode: 'stretch',
+        horizontal_spacing: '8px',
+        columns: [
+          {
+            tag: 'column',
+            width: 'weighted',
+            weight: 7,
+            vertical_align: 'top',
+            elements: [
+              {
+                tag: 'div',
+                text: {
+                  tag: 'lark_md',
+                  content: `**${displayIndex}. ${title}**`,
+                  font_size: THREAD_INLINE_TITLE_FONT_SIZE,
                 },
-              ],
-            },
-            {
-              tag: 'column',
-              width: 'auto',
-              vertical_align: 'center',
-              elements: [button],
-            },
-          ],
-        },
-      );
+              },
+              {
+                tag: 'div',
+                text: {
+                  tag: 'lark_md',
+                  content: meta || ' ',
+                  font_size: THREAD_INLINE_META_FONT_SIZE,
+                },
+              },
+            ],
+          },
+          {
+            tag: 'column',
+            width: 'auto',
+            vertical_align: 'bottom',
+            elements: [button],
+          },
+        ],
+      });
     } else {
       elements.push(
         {
@@ -418,8 +479,8 @@ export function buildThreadPickerCard(
           text: {
             tag: 'lark_md',
             content: meta
-              ? `**${index + 1}. ${title}**\n${meta}`
-              : `**${index + 1}. ${title}**`,
+              ? `**${displayIndex}. ${title}**\n${meta}`
+              : `**${displayIndex}. ${title}**`,
           },
         },
         {
@@ -434,8 +495,20 @@ export function buildThreadPickerCard(
     }
   }
 
+  if (options?.loadMoreCallbackData && startIndex + visibleThreads.length < threads.length) {
+    elements.push(
+      { tag: 'hr' },
+      ...buildActionElements([
+        { label: '查看更多', callbackData: options.loadMoreCallbackData, style: 'default' },
+      ]),
+    );
+  }
+
   return JSON.stringify({
-    config: { wide_screen_mode: true },
+    config: {
+      wide_screen_mode: false,
+      update_multi: true,
+    },
     header: {
       template: 'blue',
       title: { tag: 'plain_text', content: options?.title || '最近线程' },
@@ -453,17 +526,22 @@ export function renderThreadListText(
     return `${options?.title || '最近线程'}\n\n${options?.subtitle || '当前没有线程。'}`;
   }
 
-  const visibleThreads = threads.slice(0, options?.maxItems ?? THREAD_PICKER_MAX_ITEMS);
+  const startIndex = Math.max(0, Math.trunc(options?.startIndex ?? 0));
+  const visibleThreads = threads.slice(
+    startIndex,
+    startIndex + (options?.maxItems ?? THREAD_PICKER_MAX_ITEMS),
+  );
   const showWorkdir = new Set(visibleThreads.map((thread) => thread.workingDirectory).filter(Boolean)).size > 1;
   const lines = [options?.title || '最近线程'];
   if (options?.subtitle) {
     lines.push('', options.subtitle);
   }
   for (const [index, thread] of visibleThreads.entries()) {
+    const displayIndex = startIndex + index + 1;
     const current = thread.sessionId === currentSessionId ? ' [current]' : '';
     const title = truncateSingleLine(thread.title || `${thread.displayId.slice(0, 8)}...`, THREAD_TITLE_MAX_CHARS);
     lines.push('');
-    lines.push(`${index + 1}. ${title}${current}`);
+    lines.push(`${displayIndex}. ${title}${current}`);
     const meta = summarizeThreadMeta(thread, currentSessionId, {
       showWorkdir,
       includeProjectLabel: options?.includeProjectLabel,
@@ -473,8 +551,11 @@ export function renderThreadListText(
       lines.push(meta);
     }
   }
-  if (threads.length > visibleThreads.length) {
-    lines.push('', `仅显示最近 ${visibleThreads.length} 个线程。`);
+  if (startIndex + visibleThreads.length < threads.length) {
+    lines.push('', `本页显示第 ${startIndex + 1}-${startIndex + visibleThreads.length} 条线程。`);
+    if (options?.loadMoreCallbackData) {
+      lines.push('请在卡片中点击“查看更多”。');
+    }
   }
   lines.push('', '切换: 切换线程 2');
   return lines.join('\n');
@@ -482,59 +563,81 @@ export function renderThreadListText(
 
 export function buildProjectPickerCard(projects: ProjectSummary[]): string {
   const visibleProjects = projects.slice(0, PROJECT_PICKER_MAX_ITEMS);
-  const elements: Array<Record<string, unknown>> = [
-    {
-      tag: 'div',
-      text: {
-        tag: 'lark_md',
-        content: projects.length === 0
-          ? '当前没有可用项目。'
-          : '选择一个 Codex 项目或聊天根层，查看最近线程或在该处新建线程。',
-      },
-    },
-  ];
 
   if (projects.length === 0) {
-    return JSON.stringify({
-      config: { wide_screen_mode: true },
-      header: {
-        template: 'blue',
-        title: { tag: 'plain_text', content: '项目' },
-      },
-      elements,
-    });
+    return buildInfoCard('项目', '当前没有可用项目。');
   }
+
+  const elements: Array<Record<string, unknown>> = [];
 
   for (const [index, project] of visibleProjects.entries()) {
     const meta = [
       project.kind === 'chat-root' ? '聊天根层' : '',
-      project.threadCount > 0 ? `${project.threadCount} 条线程` : '暂无线程',
+      project.threadCount > 0 ? `${project.threadCount} 线程` : '暂无线程',
+      project.active ? '当前项目' : '',
       project.lastActiveLabel ? `最近 ${project.lastActiveLabel}` : '',
-      project.active ? '当前打开' : '',
     ].filter(Boolean).join(' · ');
+    const projectPath = compactPathLabel(project.pathLabel);
 
     elements.push(
       {
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: `**${index + 1}. ${truncateSingleLine(project.displayName, 40)}**\n${meta}\n\`${compactPathLabel(project.pathLabel)}\``,
+          content: `**${index + 1}. ${truncateSingleLine(project.displayName, PROJECT_TITLE_MAX_CHARS)}**`,
+          font_size: PROJECT_TITLE_FONT_SIZE,
         },
       },
+      ...(meta
+        ? [{
+            tag: 'div',
+            text: {
+              tag: 'lark_md',
+              content: meta,
+              font_size: PROJECT_META_FONT_SIZE,
+            },
+          } satisfies Record<string, unknown>]
+        : []),
+      ...(projectPath
+        ? [{
+            tag: 'div',
+            text: {
+              tag: 'lark_md',
+              content: projectPath,
+              font_size: PROJECT_PATH_FONT_SIZE,
+            },
+          } satisfies Record<string, unknown>]
+        : []),
       {
-        tag: 'action',
-        actions: [
+        tag: 'column_set',
+        flex_mode: 'none',
+        horizontal_spacing: '8px',
+        columns: [
           {
-            tag: 'button',
-            text: { tag: 'plain_text', content: '查看线程' },
-            type: 'default',
-            value: { callback_data: `project:threads:${encodeURIComponent(project.rootPath)}` },
+            tag: 'column',
+            width: 'auto',
+            vertical_align: 'center',
+            elements: [
+              {
+                tag: 'button',
+                text: { tag: 'plain_text', content: '查看线程' },
+                type: 'default',
+                value: { callback_data: `project:threads:${encodeURIComponent(project.rootPath)}` },
+              },
+            ],
           },
           {
-            tag: 'button',
-            text: { tag: 'plain_text', content: '新建线程' },
-            type: 'primary',
-            value: { callback_data: `project:new:${encodeURIComponent(project.rootPath)}` },
+            tag: 'column',
+            width: 'auto',
+            vertical_align: 'center',
+            elements: [
+              {
+                tag: 'button',
+                text: { tag: 'plain_text', content: '在此新建' },
+                type: 'primary',
+                value: { callback_data: `project:new:${encodeURIComponent(project.rootPath)}` },
+              },
+            ],
           },
         ],
       },
@@ -546,7 +649,7 @@ export function buildProjectPickerCard(projects: ProjectSummary[]): string {
   }
 
   return JSON.stringify({
-    config: { wide_screen_mode: true },
+    config: { wide_screen_mode: false },
     header: {
       template: 'blue',
       title: { tag: 'plain_text', content: '项目' },
@@ -578,17 +681,6 @@ export function renderProjectListText(projects: ProjectSummary[]): string {
   lines.push('设为当前项目: /project use 2');
   lines.push('在项目下新建: /project new 2');
   return lines.join('\n');
-}
-
-export function renderThreadDialogue(dialogue: { userText: string; assistantText: string }): string {
-  const parts = ['Last dialogue'];
-  if (dialogue.userText) {
-    parts.push(`User:\n${dialogue.userText}`);
-  }
-  if (dialogue.assistantText) {
-    parts.push(`Assistant:\n${dialogue.assistantText}`);
-  }
-  return parts.join('\n\n');
 }
 
 export function extractLocalFileReferences(text: string): { text: string; filePaths: string[] } {

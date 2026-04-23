@@ -2,7 +2,7 @@ import path from 'node:path';
 
 import type { Config } from '../config.js';
 import type { PendingPermissions } from '../permission-gateway.js';
-import type { JsonFileStore, ThreadDialogue, ThreadSummary, ThreadToolState } from '../store.js';
+import type { JsonFileStore, ThreadSummary, ThreadToolState } from '../store.js';
 import type {
   BridgeAdapter,
   ChannelType,
@@ -11,10 +11,10 @@ import type {
   PermissionRequestPayload,
 } from './contracts.js';
 import { runConversation } from './conversation.js';
-import { renderThreadDialogue } from './format.js';
 import { FeishuAdapter } from './feishu.js';
 
 const MAX_INPUT_LENGTH = 120_000;
+const THREAD_LIST_PAGE_SIZE = 5;
 
 function escapeHtml(value: string): string {
   return value
@@ -195,6 +195,58 @@ function decodeProjectRoot(value: string): string {
   }
 }
 
+function parsePositiveInteger(value: string): number | null {
+  if (!/^\d+$/.test(value.trim())) {
+    return null;
+  }
+  const parsed = Number.parseInt(value, 10);
+  return parsed > 0 ? parsed : null;
+}
+
+function normalizeVisibleThreadCount(value?: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return THREAD_LIST_PAGE_SIZE;
+  }
+  return Math.max(THREAD_LIST_PAGE_SIZE, Math.trunc(value));
+}
+
+function normalizeThreadPageStart(value?: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.max(0, Math.trunc(value));
+}
+
+function parseProjectThreadsCallback(value: string): { projectRoot: string; visibleCount?: number } {
+  const lastColon = value.lastIndexOf(':');
+  if (lastColon >= 0) {
+    const maybeCount = parsePositiveInteger(value.slice(lastColon + 1));
+    if (maybeCount) {
+      return {
+        projectRoot: decodeProjectRoot(value.slice(0, lastColon)),
+        visibleCount: maybeCount,
+      };
+    }
+  }
+
+  return { projectRoot: decodeProjectRoot(value) };
+}
+
+function parseProjectThreadsPageCallback(value: string): { projectRoot: string; pageStart?: number } {
+  const lastColon = value.lastIndexOf(':');
+  if (lastColon >= 0) {
+    const maybeStart = parsePositiveInteger(value.slice(lastColon + 1));
+    if (maybeStart !== null) {
+      return {
+        projectRoot: decodeProjectRoot(value.slice(0, lastColon)),
+        pageStart: maybeStart,
+      };
+    }
+  }
+
+  return { projectRoot: decodeProjectRoot(value) };
+}
+
 function permissionResolutionFromAction(action: string): {
   behavior: 'allow' | 'deny';
   updatedPermissions?: unknown[];
@@ -349,14 +401,40 @@ export class FeishuBridgeService {
       return;
     }
 
+    if (callbackData.startsWith('thread:page:')) {
+      const pageStart = parsePositiveInteger(callbackData.slice('thread:page:'.length));
+      const binding = this.resolveBinding(message.address.chatId);
+      await this.showThreads(message, binding.codepilotSessionId, pageStart ?? 0);
+      return;
+    }
+
+    if (callbackData.startsWith('thread:list:')) {
+      const visibleCount = parsePositiveInteger(callbackData.slice('thread:list:'.length));
+      const binding = this.resolveBinding(message.address.chatId);
+      const pageStart = visibleCount ? Math.max(0, visibleCount - THREAD_LIST_PAGE_SIZE) : 0;
+      await this.showThreads(message, binding.codepilotSessionId, pageStart);
+      return;
+    }
+
     if (callbackData === 'project:list') {
       await this.showProjects(message);
       return;
     }
 
+    if (callbackData.startsWith('project:threads-page:')) {
+      const { projectRoot, pageStart } = parseProjectThreadsPageCallback(
+        callbackData.slice('project:threads-page:'.length),
+      );
+      await this.showProjectThreads(message, projectRoot, pageStart ?? 0);
+      return;
+    }
+
     if (callbackData.startsWith('project:threads:')) {
-      const projectRoot = decodeProjectRoot(callbackData.slice('project:threads:'.length));
-      await this.showProjectThreads(message, projectRoot);
+      const { projectRoot, visibleCount } = parseProjectThreadsCallback(
+        callbackData.slice('project:threads:'.length),
+      );
+      const pageStart = visibleCount ? Math.max(0, visibleCount - THREAD_LIST_PAGE_SIZE) : 0;
+      await this.showProjectThreads(message, projectRoot, pageStart);
       return;
     }
 
@@ -582,19 +660,68 @@ export class FeishuBridgeService {
     }
   }
 
-  private async showThreads(message: InboundMessage, currentSessionId: string): Promise<void> {
-    const threads = this.store.listChatThreads(this.channelType, message.address.chatId);
+  private async deliverThreadPicker(
+    message: InboundMessage,
+    threads: ThreadSummary[],
+    currentSessionId: string,
+    options: {
+      title: string;
+      subtitle?: string;
+      maxItems?: number;
+      inlineRows?: boolean;
+      includeProjectLabel?: boolean;
+      actions?: Array<{ label: string; callbackData: string; style?: 'default' | 'primary' | 'danger'; disabled?: boolean }>;
+      loadMoreCallbackData?: string;
+    },
+    replaceExisting = false,
+  ): Promise<void> {
+    if (replaceExisting && message.callbackMessageId && this.adapter.updateThreadPicker) {
+      const updated = await this.adapter.updateThreadPicker(
+        message.address.chatId,
+        message.callbackMessageId,
+        threads,
+        currentSessionId,
+        options,
+      );
+      if (updated) {
+        return;
+      }
+    }
+
     await this.adapter.sendThreadPicker(
       message.address.chatId,
       threads,
       currentSessionId,
-      message.messageId,
+      message.callbackMessageId || message.messageId,
+      options,
+    );
+  }
+
+  private async showThreads(
+    message: InboundMessage,
+    currentSessionId: string,
+    pageStart = 0,
+    replaceExisting = false,
+  ): Promise<void> {
+    const threads = this.store.listChatThreads(this.channelType, message.address.chatId);
+    const normalizedPageStart = normalizeThreadPageStart(pageStart);
+    const nextPageStart = normalizedPageStart + THREAD_LIST_PAGE_SIZE < threads.length
+      ? normalizedPageStart + THREAD_LIST_PAGE_SIZE
+      : null;
+
+    await this.deliverThreadPicker(
+      message,
+      threads,
+      currentSessionId,
       {
         title: '最近线程',
-        maxItems: 8,
+        startIndex: normalizedPageStart,
+        maxItems: THREAD_LIST_PAGE_SIZE,
         inlineRows: true,
         includeProjectLabel: true,
+        loadMoreCallbackData: nextPageStart !== null ? `thread:page:${nextPageStart}` : undefined,
       },
+      replaceExisting,
     );
   }
 
@@ -603,23 +730,35 @@ export class FeishuBridgeService {
     await this.adapter.sendProjectPicker(message.address.chatId, projects, message.messageId);
   }
 
-  private async showProjectThreads(message: InboundMessage, identifier: string): Promise<void> {
+  private async showProjectThreads(
+    message: InboundMessage,
+    identifier: string,
+    pageStart = 0,
+    replaceExisting = false,
+  ): Promise<void> {
     const project = this.store.findCodexProject(identifier);
     if (!project) {
-      await this.adapter.sendText(message.address.chatId, 'Project not found.', message.messageId);
+      await this.adapter.sendText(message.address.chatId, '未找到对应项目。', message.messageId);
       return;
     }
 
     const binding = this.resolveBinding(message.address.chatId);
     const threads = this.store.listProjectThreads(this.channelType, message.address.chatId, project.rootPath);
-    await this.adapter.sendThreadPicker(
-      message.address.chatId,
+    const normalizedPageStart = normalizeThreadPageStart(pageStart);
+    const nextPageStart = normalizedPageStart + THREAD_LIST_PAGE_SIZE < threads.length
+      ? normalizedPageStart + THREAD_LIST_PAGE_SIZE
+      : null;
+
+    await this.deliverThreadPicker(
+      message,
       threads,
       binding.codepilotSessionId,
-      message.messageId,
       {
         title: `${project.displayName} · 线程`,
         subtitle: `项目：${project.displayName}`,
+        startIndex: normalizedPageStart,
+        maxItems: THREAD_LIST_PAGE_SIZE,
+        inlineRows: true,
         actions: [
           { label: '项目列表', callbackData: 'project:list', style: 'default' },
           {
@@ -630,14 +769,18 @@ export class FeishuBridgeService {
           },
           { label: '在此新建', callbackData: `project:new:${encodeProjectRoot(project.rootPath)}`, style: 'primary' },
         ],
+        loadMoreCallbackData: nextPageStart !== null
+          ? `project:threads-page:${encodeProjectRoot(project.rootPath)}:${nextPageStart}`
+          : undefined,
       },
+      replaceExisting,
     );
   }
 
   private async selectProject(message: InboundMessage, identifier: string): Promise<void> {
     const project = this.store.findCodexProject(identifier);
     if (!project) {
-      await this.adapter.sendText(message.address.chatId, 'Project not found.', message.messageId);
+      await this.adapter.sendText(message.address.chatId, '未找到对应项目。', message.messageId);
       return;
     }
 
@@ -647,7 +790,7 @@ export class FeishuBridgeService {
     });
     await this.adapter.sendCommandReply(
       message.address.chatId,
-      `<b>已切换当前项目</b>\n\n<b>${escapeHtml(project.displayName)}</b>\n<code>${escapeHtml(project.rootPath)}</code>\n\n后续 <code>/new</code> 会默认在这个项目下创建线程。`,
+      `<b>已切换当前项目</b>\n\n<b>${escapeHtml(project.displayName)}</b>\n\n后续 <code>/new</code> 会默认在这个项目下创建线程。`,
       message.messageId,
     );
   }
@@ -656,9 +799,10 @@ export class FeishuBridgeService {
     const newBinding = this.createBinding(message.address.chatId, workDir);
     const summary = this.store.describeChatThread(this.channelType, message.address.chatId, newBinding.codepilotSessionId);
     const title = summary?.title || '新线程';
+    const projectLabel = summary?.projectLabel || '聊天';
     await this.adapter.sendCommandReply(
       message.address.chatId,
-      `<b>已新建线程</b>\n\n<b>${escapeHtml(title)}</b>`,
+      `<b>已新建线程</b>\n\n<b>${escapeHtml(title)}</b>\n项目：${escapeHtml(projectLabel)}`,
       message.messageId,
     );
   }
@@ -667,7 +811,7 @@ export class FeishuBridgeService {
     const currentBinding = this.resolveBinding(message.address.chatId);
     const target = this.store.findChatThread(this.channelType, message.address.chatId, identifier);
     if (!target) {
-      await this.adapter.sendText(message.address.chatId, 'Thread not found.', message.messageId);
+      await this.adapter.sendText(message.address.chatId, '未找到对应线程。', message.messageId);
       return;
     }
 
@@ -676,7 +820,7 @@ export class FeishuBridgeService {
       : target;
 
     if (!resolved) {
-      await this.adapter.sendText(message.address.chatId, 'Thread import failed.', message.messageId);
+      await this.adapter.sendText(message.address.chatId, '导入线程失败。', message.messageId);
       return;
     }
 
@@ -697,18 +841,13 @@ export class FeishuBridgeService {
 
     await this.adapter.sendCommandReply(
       message.address.chatId,
-      `Switched thread\nThread: <code>${escapeHtml(resolved.displayId.slice(0, 8))}...</code>\nTitle: ${escapeHtml(resolved.title)}\nCWD: <code>${escapeHtml(resolved.workingDirectory || '~')}</code>`,
+      `<b>已切换线程</b>\n\n<b>${escapeHtml(resolved.title)}</b>\n项目：${escapeHtml(resolved.projectLabel || '聊天')}`,
       message.messageId,
     );
 
     const mirrored = await this.maybeMirrorBusyThread(message, this.resolveBinding(message.address.chatId));
     if (mirrored) {
       return;
-    }
-
-    const dialogue = this.store.getThreadLatestDialogue(resolved.sessionId);
-    if (dialogue && (dialogue.userText || dialogue.assistantText)) {
-      await this.adapter.sendMarkdown(message.address.chatId, renderThreadDialogue(dialogue), message.messageId);
     }
   }
 
