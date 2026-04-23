@@ -11,7 +11,9 @@ import type {
   ThreadPickerOptions,
   ThreadSummary,
   ToolProgress,
+  UiLanguage,
 } from './contracts.js';
+import { getUiText } from './i18n.js';
 import { htmlToMarkdown, renderProjectListText, renderThreadListText } from './format.js';
 
 type InboundHandler = (message: InboundMessage) => Promise<void>;
@@ -223,14 +225,16 @@ export class RokidAdapter implements BridgeAdapter {
     body: string,
     permissionId: string,
     _replyToMessageId?: string,
+    language: UiLanguage = 'zh-CN',
   ): Promise<SendResult> {
     const state = this.active.get(chatId);
     if (!state) return { ok: false, error: 'Rokid stream not found' };
+    const copy = getUiText(language);
     this.writeEvent(state, 'permission_request', {
       type: 'permission_request',
       permission_id: permissionId,
       content: body,
-      message: '需要在 Codex 桌面端或 Feishu 审批后继续。',
+      message: copy.permission.continueInDesktopOrFeishu,
     });
     return { ok: true, messageId: state.messageId };
   }
@@ -256,15 +260,20 @@ export class RokidAdapter implements BridgeAdapter {
     return result.ok;
   }
 
-  async sendProjectPicker(chatId: string, projects: ProjectSummary[], replyToMessageId?: string): Promise<SendResult> {
-    return this.sendText(chatId, renderProjectListText(projects), replyToMessageId);
+  async sendProjectPicker(
+    chatId: string,
+    projects: ProjectSummary[],
+    replyToMessageId?: string,
+    language: UiLanguage = 'zh-CN',
+  ): Promise<SendResult> {
+    return this.sendText(chatId, renderProjectListText(projects, language), replyToMessageId);
   }
 
   async sendCommandReply(chatId: string, text: string, replyToMessageId?: string): Promise<void> {
     await this.sendHtml(chatId, text, replyToMessageId);
   }
 
-  beginResponse(chatId: string, _replyToMessageId?: string): void {
+  beginResponse(chatId: string, _replyToMessageId?: string, _language?: UiLanguage): void {
     const state = this.active.get(chatId);
     if (!state) return;
     this.writeEvent(state, 'status', {

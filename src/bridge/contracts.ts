@@ -1,5 +1,6 @@
 export type BridgeMode = 'code' | 'plan' | 'ask';
 export type ChannelType = 'feishu' | 'rokid';
+export type UiLanguage = 'zh-CN' | 'en';
 
 export interface ChannelAddress {
   channelType: ChannelType;
@@ -51,6 +52,7 @@ export interface ChannelBinding {
   sdkSessionId: string;
   workingDirectory: string;
   preferredWorkingDirectory?: string;
+  preferredLanguage?: UiLanguage;
   model: string;
   mode: BridgeMode;
   active: boolean;
@@ -255,6 +257,7 @@ export interface ThreadPickerOptions {
   maxItems?: number;
   inlineRows?: boolean;
   includeProjectLabel?: boolean;
+  language?: UiLanguage;
   actions?: ThreadPickerAction[];
   loadMoreCallbackData?: string;
 }
@@ -268,7 +271,13 @@ export interface BridgeAdapter {
   sendText(chatId: string, text: string, replyToMessageId?: string): Promise<SendResult>;
   sendHtml(chatId: string, html: string, replyToMessageId?: string): Promise<SendResult>;
   sendMarkdown(chatId: string, markdown: string, replyToMessageId?: string): Promise<SendResult>;
-  sendPermissionRequest(chatId: string, body: string, permissionId: string, replyToMessageId?: string): Promise<SendResult>;
+  sendPermissionRequest(
+    chatId: string,
+    body: string,
+    permissionId: string,
+    replyToMessageId?: string,
+    language?: UiLanguage,
+  ): Promise<SendResult>;
   sendThreadPicker(
     chatId: string,
     threads: ThreadSummary[],
@@ -283,9 +292,14 @@ export interface BridgeAdapter {
     currentSessionId: string,
     options?: ThreadPickerOptions,
   ): Promise<boolean>;
-  sendProjectPicker(chatId: string, projects: ProjectSummary[], replyToMessageId?: string): Promise<SendResult>;
+  sendProjectPicker(
+    chatId: string,
+    projects: ProjectSummary[],
+    replyToMessageId?: string,
+    language?: UiLanguage,
+  ): Promise<SendResult>;
   sendCommandReply(chatId: string, text: string, replyToMessageId?: string): Promise<void>;
-  beginResponse(chatId: string, replyToMessageId?: string): void;
+  beginResponse(chatId: string, replyToMessageId?: string, language?: UiLanguage): void;
   updateResponse(chatId: string, fullText: string, tools: ToolProgress[]): void;
   finalizeResponse(
     chatId: string,

@@ -14,6 +14,7 @@ import type {
   ThreadPickerOptions,
   ThreadSummary,
   ToolProgress,
+  UiLanguage,
 } from './contracts.js';
 import {
   buildInfoCard,
@@ -32,6 +33,7 @@ import {
   renderProjectListText,
   renderThreadListText,
 } from './format.js';
+import { getUiText } from './i18n.js';
 
 type InboundHandler = (message: InboundMessage) => Promise<void>;
 
@@ -87,6 +89,7 @@ type FeishuMessageEventData = {
 type ActiveCardState = {
   messageId: string;
   startedAt: number;
+  language: UiLanguage;
   text: string;
   tools: ToolProgress[];
   thinking: boolean;
@@ -284,13 +287,20 @@ export class FeishuAdapter implements BridgeAdapter {
     return lastResult;
   }
 
-  async sendPermissionRequest(chatId: string, body: string, permissionId: string, replyToMessageId?: string): Promise<SendResult> {
-    const cardJson = buildPermissionCard(body, permissionId);
+  async sendPermissionRequest(
+    chatId: string,
+    body: string,
+    permissionId: string,
+    replyToMessageId?: string,
+    language: UiLanguage = 'zh-CN',
+  ): Promise<SendResult> {
+    const cardJson = buildPermissionCard(body, permissionId, language);
     const result = await this.sendInteractiveCard(chatId, cardJson, replyToMessageId);
     if (result.ok) return result;
+    const copy = getUiText(language);
     return this.sendText(
       chatId,
-      `${body}\n\nReply:\n1 - Allow\n2 - Allow Session\n3 - Deny\n\nOr use /perm allow|allow_session|deny ${permissionId}`,
+      `${body}\n\n${copy.permission.fallback(permissionId)}`,
       replyToMessageId,
     );
   }
@@ -328,16 +338,21 @@ export class FeishuAdapter implements BridgeAdapter {
     }
   }
 
-  async sendProjectPicker(chatId: string, projects: ProjectSummary[], replyToMessageId?: string): Promise<SendResult> {
-    const cardJson = buildProjectPickerCard(projects);
+  async sendProjectPicker(
+    chatId: string,
+    projects: ProjectSummary[],
+    replyToMessageId?: string,
+    language: UiLanguage = 'zh-CN',
+  ): Promise<SendResult> {
+    const cardJson = buildProjectPickerCard(projects, language);
     const result = await this.sendInteractiveCard(chatId, cardJson, replyToMessageId);
     if (result.ok) return result;
-    return this.sendText(chatId, renderProjectListText(projects), replyToMessageId);
+    return this.sendText(chatId, renderProjectListText(projects, language), replyToMessageId);
   }
 
-  beginResponse(chatId: string, replyToMessageId?: string): void {
+  beginResponse(chatId: string, replyToMessageId?: string, language: UiLanguage = 'zh-CN'): void {
     void this.addTypingReaction(chatId);
-    void this.ensureStreamingCard(chatId, replyToMessageId);
+    void this.ensureStreamingCard(chatId, replyToMessageId, language);
   }
 
   updateResponse(chatId: string, fullText: string, tools: ToolProgress[]): void {
@@ -378,10 +393,10 @@ export class FeishuAdapter implements BridgeAdapter {
 
     try {
       const statusLabel = status === 'completed'
-        ? '✅ Completed'
+        ? getUiText(state.language).streaming.statusCompleted
         : status === 'error'
-          ? '❌ Error'
-          : '⚠️ Interrupted';
+          ? getUiText(state.language).streaming.statusError
+          : getUiText(state.language).streaming.statusInterrupted;
       const streamedText = state.text.trim();
       const finalContent = finalText.trim();
       const shouldSendSeparateFinalCard = status === 'completed'
@@ -396,6 +411,7 @@ export class FeishuAdapter implements BridgeAdapter {
           content: buildStreamingCard(text, state.tools, {
             status: statusLabel,
             elapsed: formatElapsed(state.startedAt),
+            language: state.language,
           }),
         },
       });
@@ -480,7 +496,7 @@ export class FeishuAdapter implements BridgeAdapter {
     return this.sendText(chatId, text, replyToMessageId);
   }
 
-  private async ensureStreamingCard(chatId: string, replyToMessageId?: string): Promise<boolean> {
+  private async ensureStreamingCard(chatId: string, replyToMessageId?: string, language: UiLanguage = 'zh-CN'): Promise<boolean> {
     if (!this.restClient || this.activeCards.has(chatId)) return false;
     const existing = this.cardCreates.get(chatId);
     if (existing) return existing;
@@ -489,7 +505,7 @@ export class FeishuAdapter implements BridgeAdapter {
       try {
         const result = await this.sendInteractiveCard(
           chatId,
-          buildStreamingCard('', [], { thinking: true }),
+          buildStreamingCard('', [], { thinking: true, language }),
           replyToMessageId,
         );
         if (!result.ok || !result.messageId) {
@@ -498,6 +514,7 @@ export class FeishuAdapter implements BridgeAdapter {
         this.activeCards.set(chatId, {
           messageId: result.messageId,
           startedAt: Date.now(),
+          language,
           text: '',
           tools: [],
           thinking: true,
@@ -591,7 +608,7 @@ export class FeishuAdapter implements BridgeAdapter {
     try {
       await this.restClient.im.message.patch({
         path: { message_id: state.messageId },
-        data: { content: buildStreamingCard(text, tools, { thinking }) },
+        data: { content: buildStreamingCard(text, tools, { thinking, language: state.language }) },
       });
       state.lastSentKey = key;
       state.lastSentTextLength = text.length;

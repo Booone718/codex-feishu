@@ -9,12 +9,16 @@ import type {
   ChannelBinding,
   InboundMessage,
   PermissionRequestPayload,
+  UiLanguage,
 } from './contracts.js';
 import { runConversation } from './conversation.js';
 import { FeishuAdapter } from './feishu.js';
+import { getUiText } from './i18n.js';
 
 const MAX_INPUT_LENGTH = 120_000;
 const THREAD_LIST_PAGE_SIZE = 5;
+const HAN_CHAR_RE = /\p{Script=Han}/u;
+const ENGLISH_WORD_RE = /[A-Za-z]{2,}/g;
 
 function escapeHtml(value: string): string {
   return value
@@ -75,20 +79,22 @@ function summarizePermissionScopes(value: unknown): string {
 function renderPermissionRequestBody(
   binding: ChannelBinding,
   payload: PermissionRequestPayload,
+  language: UiLanguage,
   options?: { autoAllowed?: boolean },
 ): string {
+  const copy = getUiText(language);
   const lines: string[] = [];
   if (options?.autoAllowed) {
-    lines.push('Rokid 通道已自动允许。');
+    lines.push(copy.permissionBody.autoAllowed);
   }
 
-  lines.push(`**工具：** ${inlineCode(payload.toolName)}`);
+  lines.push(`**${copy.permissionBody.tool}：** ${inlineCode(payload.toolName)}`);
 
   const reason = typeof payload.toolInput.reason === 'string'
     ? truncateInlineValue(payload.toolInput.reason, 100)
     : '';
   if (reason) {
-    lines.push(`**说明：** ${reason}`);
+    lines.push(`**${copy.permissionBody.reason}：** ${reason}`);
   }
 
   if (payload.toolName === 'Bash') {
@@ -99,31 +105,31 @@ function renderPermissionRequestBody(
       ? truncateInlineValue(payload.toolInput.cwd, 72)
       : '';
     if (command) {
-      lines.push(`**命令：** ${inlineCode(command)}`);
+      lines.push(`**${copy.permissionBody.command}：** ${inlineCode(command)}`);
     }
     if (cwd) {
-      lines.push(`**目录：** ${inlineCode(cwd)}`);
+      lines.push(`**${copy.permissionBody.directory}：** ${inlineCode(cwd)}`);
     }
   } else if (payload.toolName === 'Edit') {
     const grantRoot = typeof payload.toolInput.grantRoot === 'string'
       ? truncateInlineValue(payload.toolInput.grantRoot, 72)
       : '';
     if (grantRoot) {
-      lines.push(`**范围：** ${inlineCode(grantRoot)}`);
+      lines.push(`**${copy.permissionBody.scope}：** ${inlineCode(grantRoot)}`);
     }
   } else if (payload.toolName === 'Permissions') {
     const scopes = summarizePermissionScopes(payload.toolInput.permissions);
     if (scopes) {
-      lines.push(`**权限：** ${scopes}`);
+      lines.push(`**${copy.permissionBody.permissions}：** ${scopes}`);
     }
   } else {
     const detail = truncateInlineValue(JSON.stringify(payload.toolInput), 100);
     if (detail) {
-      lines.push(`**详情：** ${inlineCode(detail)}`);
+      lines.push(`**${copy.permissionBody.details}：** ${inlineCode(detail)}`);
     }
   }
 
-  lines.push(`**线程：** ${inlineCode(`${binding.codepilotSessionId.slice(0, 8)}...`)}`);
+  lines.push(`**${copy.permissionBody.thread}：** ${inlineCode(`${binding.codepilotSessionId.slice(0, 8)}...`)}`);
   return lines.join('\n');
 }
 
@@ -132,6 +138,36 @@ function truncateInput(text: string): string {
     return text;
   }
   return text.slice(0, MAX_INPUT_LENGTH);
+}
+
+function getDefaultUiLanguage(): UiLanguage {
+  const locale = Intl.DateTimeFormat().resolvedOptions().locale || process.env.LANG || '';
+  return /^zh(?:[-_]|$)/i.test(locale) ? 'zh-CN' : 'en';
+}
+
+function detectUiLanguageFromText(value: string): UiLanguage | null {
+  const normalized = normalizeText(value);
+  if (!normalized) {
+    return null;
+  }
+  if (HAN_CHAR_RE.test(normalized)) {
+    return 'zh-CN';
+  }
+
+  const commandless = normalized.startsWith('/')
+    ? normalized.replace(/^\/\S+/, '').trim()
+    : normalized;
+  if (!commandless) {
+    return null;
+  }
+
+  const words = commandless.match(ENGLISH_WORD_RE) || [];
+  if (words.length === 0) {
+    return null;
+  }
+
+  const letters = words.join('').length;
+  return letters >= 4 ? 'en' : null;
 }
 
 function isAbsoluteDir(value: string): boolean {
@@ -351,12 +387,12 @@ export class FeishuBridgeService {
 
     const mappedThreadCommand = mapThreadShortcut(message.text);
     if (mappedThreadCommand) {
-      await this.handleCommand(message, mappedThreadCommand);
+      await this.handleCommand(message, mappedThreadCommand, message.text);
       return;
     }
 
     if (message.text.startsWith('/')) {
-      await this.handleCommand(message, message.text);
+      await this.handleCommand(message, message.text, message.text);
       return;
     }
 
@@ -366,6 +402,7 @@ export class FeishuBridgeService {
     }
 
     const binding = this.resolveBinding(message.address.chatId);
+    this.rememberPreferredLanguage(binding, message.text);
     const chain = this.sessionChains.get(binding.codepilotSessionId) || Promise.resolve();
     const next = chain.then(
       () => this.handleConversationMessage(message, binding),
@@ -382,6 +419,9 @@ export class FeishuBridgeService {
 
   private async handleCallback(message: InboundMessage): Promise<void> {
     const callbackData = message.callbackData || '';
+    const binding = this.resolveBinding(message.address.chatId);
+    const uiLanguage = this.currentUiLanguage(binding);
+    const copy = getUiText(uiLanguage);
     if (callbackData.startsWith('perm:')) {
       const parts = callbackData.split(':');
       const action = parts[1];
@@ -389,7 +429,7 @@ export class FeishuBridgeService {
       const handled = this.resolvePermission(permissionId, action);
       await this.adapter.sendText(
         message.address.chatId,
-        handled ? 'Permission response recorded.' : 'Permission not found or already resolved.',
+        handled ? copy.permission.responseRecorded : copy.permission.notFoundOrResolved,
         message.callbackMessageId || message.messageId,
       );
       return;
@@ -403,14 +443,12 @@ export class FeishuBridgeService {
 
     if (callbackData.startsWith('thread:page:')) {
       const pageStart = parsePositiveInteger(callbackData.slice('thread:page:'.length));
-      const binding = this.resolveBinding(message.address.chatId);
       await this.showThreads(message, binding.codepilotSessionId, pageStart ?? 0);
       return;
     }
 
     if (callbackData.startsWith('thread:list:')) {
       const visibleCount = parsePositiveInteger(callbackData.slice('thread:list:'.length));
-      const binding = this.resolveBinding(message.address.chatId);
       const pageStart = visibleCount ? Math.max(0, visibleCount - THREAD_LIST_PAGE_SIZE) : 0;
       await this.showThreads(message, binding.codepilotSessionId, pageStart);
       return;
@@ -451,19 +489,19 @@ export class FeishuBridgeService {
     }
 
     if (callbackData === 'thread:list') {
-      const binding = this.resolveBinding(message.address.chatId);
       await this.showThreads(message, binding.codepilotSessionId);
       return;
     }
 
     if (callbackData === 'thread:new') {
-      const binding = this.resolveBinding(message.address.chatId);
       await this.createAndSwitchThread(message, this.resolveNewThreadWorkdir(binding));
       return;
     }
   }
 
   private async handlePermissionShortcut(message: InboundMessage): Promise<boolean> {
+    const binding = this.resolveBinding(message.address.chatId);
+    const copy = getUiText(this.currentUiLanguage(binding));
     const pendingLinks = this.store.listPendingPermissionLinksByChat(message.address.chatId);
     if (pendingLinks.length === 0) {
       return false;
@@ -471,7 +509,7 @@ export class FeishuBridgeService {
     if (pendingLinks.length > 1) {
       await this.adapter.sendText(
         message.address.chatId,
-        `Multiple pending permissions (${pendingLinks.length}). Please use /perm allow|allow_session|deny <id>.`,
+        copy.permission.multiplePending(pendingLinks.length),
         message.messageId,
       );
       return true;
@@ -482,37 +520,29 @@ export class FeishuBridgeService {
     const handled = this.resolvePermission(pendingLinks[0].permissionRequestId, action);
     await this.adapter.sendText(
       message.address.chatId,
-      handled ? `${action === 'allow' ? 'Allow' : action === 'allow_session' ? 'Allow Session' : 'Deny'}: recorded.` : 'Permission not found or already resolved.',
+      handled ? copy.permission.actionRecorded(action) : copy.permission.notFoundOrResolved,
       message.messageId,
     );
     return true;
   }
 
-  private async handleCommand(message: InboundMessage, rawText: string): Promise<void> {
+  private async handleCommand(message: InboundMessage, rawText: string, localeHintText = rawText): Promise<void> {
     const normalized = normalizeText(rawText);
     const [rawCommand, ...rest] = normalized.split(/\s+/);
     const command = rawCommand.toLowerCase();
     const args = rest.join(' ').trim();
     const binding = this.resolveBinding(message.address.chatId);
+    const uiLanguage = this.resolveUiLanguage(binding, localeHintText);
+    const copy = getUiText(uiLanguage);
 
     switch (command) {
       case '/start':
       case '/help':
-        await this.adapter.sendCommandReply(message.address.chatId, [
-          `<b>Codex ${this.adapter.displayName}</b>`,
-          '',
-          '/new [path] - Start a new thread',
-          '/cwd /abs/path - Change working directory',
-          '/mode code|plan|ask - Change mode',
-          '/status - Show current thread',
-          '/threads - Show thread picker',
-          '/projects - Show Codex projects',
-          '/project list | use <id> | threads <id> | new <id>',
-          '/thread switch <id|index> - Switch thread',
-          '/stop - Stop current task',
-          '/perm allow|allow_session|deny <id> - Resolve permission',
-          '/permtest - Trigger an approval test',
-        ].join('\n'), message.messageId);
+        await this.adapter.sendCommandReply(
+          message.address.chatId,
+          copy.helpReply(this.adapter.displayName),
+          message.messageId,
+        );
         return;
 
       case '/new': {
@@ -525,7 +555,7 @@ export class FeishuBridgeService {
 
       case '/cwd': {
         if (!args || !isAbsoluteDir(args)) {
-          await this.adapter.sendText(message.address.chatId, 'Usage: /cwd /absolute/path', message.messageId);
+          await this.adapter.sendText(message.address.chatId, copy.command.cwdUsage, message.messageId);
           return;
         }
         this.store.updateChannelBinding(binding.id, {
@@ -533,17 +563,17 @@ export class FeishuBridgeService {
           preferredWorkingDirectory: args,
         });
         this.store.touchChatThread(this.channelType, message.address.chatId, binding.codepilotSessionId, { workingDirectory: args });
-        await this.adapter.sendCommandReply(message.address.chatId, `Working directory set to <code>${escapeHtml(args)}</code>`, message.messageId);
+        await this.adapter.sendCommandReply(message.address.chatId, copy.command.cwdSet(escapeHtml(args)), message.messageId);
         return;
       }
 
       case '/mode': {
         if (!validateMode(args)) {
-          await this.adapter.sendText(message.address.chatId, 'Usage: /mode code|plan|ask', message.messageId);
+          await this.adapter.sendText(message.address.chatId, copy.command.modeUsage, message.messageId);
           return;
         }
         this.store.updateChannelBinding(binding.id, { mode: args });
-        await this.adapter.sendCommandReply(message.address.chatId, `Mode set to <b>${args}</b>`, message.messageId);
+        await this.adapter.sendCommandReply(message.address.chatId, copy.command.modeSet(args), message.messageId);
         return;
       }
 
@@ -551,21 +581,21 @@ export class FeishuBridgeService {
         const summary = this.store.describeChatThread(this.channelType, message.address.chatId, binding.codepilotSessionId);
         const busy = this.store.getBusyLocalThreadState(binding.codepilotSessionId);
         const lines = [
-          `<b>Codex ${this.adapter.displayName} Status</b>`,
+          `<b>${copy.command.statusTitle(this.adapter.displayName)}</b>`,
           '',
-          `Session: <code>${binding.codepilotSessionId.slice(0, 8)}...</code>`,
-          `CWD: <code>${escapeHtml(binding.workingDirectory || '~')}</code>`,
-          `Mode: <b>${binding.mode}</b>`,
-          `Model: <code>${escapeHtml(binding.model || 'default')}</code>`,
+          `${copy.command.session}: <code>${binding.codepilotSessionId.slice(0, 8)}...</code>`,
+          `${copy.command.cwd}: <code>${escapeHtml(binding.workingDirectory || '~')}</code>`,
+          `${copy.command.mode}: <b>${binding.mode}</b>`,
+          `${copy.command.model}: <code>${escapeHtml(binding.model || 'default')}</code>`,
         ];
         if (summary?.latestUserPreview) {
-          lines.push(`Recent: ${escapeHtml(summary.latestUserPreview)}`);
+          lines.push(`${copy.command.recent}: ${escapeHtml(summary.latestUserPreview)}`);
         }
         if (binding.preferredWorkingDirectory && binding.preferredWorkingDirectory !== binding.workingDirectory) {
-          lines.push(`Project: <code>${escapeHtml(binding.preferredWorkingDirectory)}</code>`);
+          lines.push(`${copy.command.project}: <code>${escapeHtml(binding.preferredWorkingDirectory)}</code>`);
         }
         if (busy) {
-          lines.push('Busy: <b>desktop thread active</b>');
+          lines.push(`${copy.command.busy}: <b>${copy.command.desktopThreadActive}</b>`);
         }
         await this.adapter.sendCommandReply(message.address.chatId, lines.join('\n'), message.messageId);
         return;
@@ -581,7 +611,7 @@ export class FeishuBridgeService {
 
       case '/thread':
         if (!args) {
-          await this.adapter.sendText(message.address.chatId, 'Usage: /thread list | /thread switch <index|id>', message.messageId);
+          await this.adapter.sendText(message.address.chatId, copy.command.threadUsage, message.messageId);
           return;
         }
         if (args === 'list') {
@@ -596,7 +626,7 @@ export class FeishuBridgeService {
           await this.createAndSwitchThread(message, this.resolveNewThreadWorkdir(binding));
           return;
         }
-        await this.adapter.sendText(message.address.chatId, 'Usage: /thread list | /thread switch <index|id>', message.messageId);
+        await this.adapter.sendText(message.address.chatId, copy.command.threadUsage, message.messageId);
         return;
 
       case '/project':
@@ -615,37 +645,37 @@ export class FeishuBridgeService {
         if (args.startsWith('new ')) {
           const project = this.store.findCodexProject(args.slice('new '.length).trim());
           if (!project) {
-            await this.adapter.sendText(message.address.chatId, 'Project not found.', message.messageId);
+            await this.adapter.sendText(message.address.chatId, copy.command.projectNotFound, message.messageId);
             return;
           }
           await this.createAndSwitchThread(message, project.rootPath);
           return;
         }
-        await this.adapter.sendText(message.address.chatId, 'Usage: /project list | /project use <index|name> | /project threads <index|name> | /project new <index|name>', message.messageId);
+        await this.adapter.sendText(message.address.chatId, copy.command.projectUsage, message.messageId);
         return;
 
       case '/stop': {
         const active = this.activeTasks.get(binding.codepilotSessionId);
         if (!active) {
-          await this.adapter.sendText(message.address.chatId, 'No task is currently running.', message.messageId);
+          await this.adapter.sendText(message.address.chatId, copy.command.noTaskRunning, message.messageId);
           return;
         }
         active.abortController.abort();
         this.activeTasks.delete(binding.codepilotSessionId);
-        await this.adapter.sendText(message.address.chatId, 'Stopping current task...', message.messageId);
+        await this.adapter.sendText(message.address.chatId, copy.command.stoppingTask, message.messageId);
         return;
       }
 
       case '/perm': {
         const [action, permissionId] = args.split(/\s+/, 2);
         if (!action || !permissionId) {
-          await this.adapter.sendText(message.address.chatId, 'Usage: /perm allow|allow_session|deny <id>', message.messageId);
+          await this.adapter.sendText(message.address.chatId, copy.command.permUsage, message.messageId);
           return;
         }
         const handled = this.resolvePermission(permissionId, action);
         await this.adapter.sendText(
           message.address.chatId,
-          handled ? `Permission ${action}: recorded.` : 'Permission not found or already resolved.',
+          handled ? copy.command.permRecorded(action) : copy.permission.notFoundOrResolved,
           message.messageId,
         );
         return;
@@ -656,7 +686,7 @@ export class FeishuBridgeService {
         return;
 
       default:
-        await this.adapter.sendText(message.address.chatId, `Unknown command: ${command}`, message.messageId);
+        await this.adapter.sendText(message.address.chatId, copy.command.unknownCommand(command), message.messageId);
     }
   }
 
@@ -703,6 +733,9 @@ export class FeishuBridgeService {
     pageStart = 0,
     replaceExisting = false,
   ): Promise<void> {
+    const binding = this.resolveBinding(message.address.chatId);
+    const uiLanguage = this.currentUiLanguage(binding);
+    const copy = getUiText(uiLanguage);
     const threads = this.store.listChatThreads(this.channelType, message.address.chatId);
     const normalizedPageStart = normalizeThreadPageStart(pageStart);
     const nextPageStart = normalizedPageStart + THREAD_LIST_PAGE_SIZE < threads.length
@@ -714,11 +747,12 @@ export class FeishuBridgeService {
       threads,
       currentSessionId,
       {
-        title: '最近线程',
+        title: copy.threadPicker.title,
         startIndex: normalizedPageStart,
         maxItems: THREAD_LIST_PAGE_SIZE,
         inlineRows: true,
         includeProjectLabel: true,
+        language: uiLanguage,
         loadMoreCallbackData: nextPageStart !== null ? `thread:page:${nextPageStart}` : undefined,
       },
       replaceExisting,
@@ -726,8 +760,10 @@ export class FeishuBridgeService {
   }
 
   private async showProjects(message: InboundMessage): Promise<void> {
+    const binding = this.resolveBinding(message.address.chatId);
+    const uiLanguage = this.currentUiLanguage(binding);
     const projects = this.store.listCodexProjects();
-    await this.adapter.sendProjectPicker(message.address.chatId, projects, message.messageId);
+    await this.adapter.sendProjectPicker(message.address.chatId, projects, message.messageId, uiLanguage);
   }
 
   private async showProjectThreads(
@@ -736,13 +772,15 @@ export class FeishuBridgeService {
     pageStart = 0,
     replaceExisting = false,
   ): Promise<void> {
+    const binding = this.resolveBinding(message.address.chatId);
+    const uiLanguage = this.currentUiLanguage(binding);
+    const copy = getUiText(uiLanguage);
     const project = this.store.findCodexProject(identifier);
     if (!project) {
-      await this.adapter.sendText(message.address.chatId, '未找到对应项目。', message.messageId);
+      await this.adapter.sendText(message.address.chatId, copy.command.projectNotFound, message.messageId);
       return;
     }
 
-    const binding = this.resolveBinding(message.address.chatId);
     const threads = this.store.listProjectThreads(this.channelType, message.address.chatId, project.rootPath);
     const normalizedPageStart = normalizeThreadPageStart(pageStart);
     const nextPageStart = normalizedPageStart + THREAD_LIST_PAGE_SIZE < threads.length
@@ -754,20 +792,23 @@ export class FeishuBridgeService {
       threads,
       binding.codepilotSessionId,
       {
-        title: `${project.displayName} · 线程`,
-        subtitle: `项目：${project.displayName}`,
+        title: copy.projectPicker.projectThreadsTitle(project.displayName),
+        subtitle: copy.projectPicker.projectSubtitle(project.displayName),
         startIndex: normalizedPageStart,
         maxItems: THREAD_LIST_PAGE_SIZE,
         inlineRows: true,
+        language: uiLanguage,
         actions: [
-          { label: '项目列表', callbackData: 'project:list', style: 'default' },
+          { label: copy.projectPicker.projectList, callbackData: 'project:list', style: 'default' },
           {
-            label: binding.preferredWorkingDirectory === project.rootPath ? '当前项目' : '使用项目',
+            label: binding.preferredWorkingDirectory === project.rootPath
+              ? copy.projectPicker.currentProject
+              : copy.projectPicker.useProject,
             callbackData: `project:use:${encodeProjectRoot(project.rootPath)}`,
             style: 'default',
             disabled: binding.preferredWorkingDirectory === project.rootPath,
           },
-          { label: '在此新建', callbackData: `project:new:${encodeProjectRoot(project.rootPath)}`, style: 'primary' },
+          { label: copy.projectPicker.createHere, callbackData: `project:new:${encodeProjectRoot(project.rootPath)}`, style: 'primary' },
         ],
         loadMoreCallbackData: nextPageStart !== null
           ? `project:threads-page:${encodeProjectRoot(project.rootPath)}:${nextPageStart}`
@@ -779,39 +820,43 @@ export class FeishuBridgeService {
 
   private async selectProject(message: InboundMessage, identifier: string): Promise<void> {
     const project = this.store.findCodexProject(identifier);
+    const binding = this.resolveBinding(message.address.chatId);
+    const copy = getUiText(this.currentUiLanguage(binding));
     if (!project) {
-      await this.adapter.sendText(message.address.chatId, '未找到对应项目。', message.messageId);
+      await this.adapter.sendText(message.address.chatId, copy.command.projectNotFound, message.messageId);
       return;
     }
 
-    const binding = this.resolveBinding(message.address.chatId);
     this.store.updateChannelBinding(binding.id, {
       preferredWorkingDirectory: project.rootPath,
     });
     await this.adapter.sendCommandReply(
       message.address.chatId,
-      `<b>已切换当前项目</b>\n\n<b>${escapeHtml(project.displayName)}</b>\n\n后续 <code>/new</code> 会默认在这个项目下创建线程。`,
+      copy.command.switchedCurrentProject(escapeHtml(project.displayName)),
       message.messageId,
     );
   }
 
   private async createAndSwitchThread(message: InboundMessage, workDir?: string): Promise<void> {
+    const binding = this.resolveBinding(message.address.chatId);
+    const copy = getUiText(this.currentUiLanguage(binding));
     const newBinding = this.createBinding(message.address.chatId, workDir);
     const summary = this.store.describeChatThread(this.channelType, message.address.chatId, newBinding.codepilotSessionId);
-    const title = summary?.title || '新线程';
-    const projectLabel = summary?.projectLabel || '聊天';
+    const title = summary?.title || copy.command.newThreadDefaultTitle;
+    const projectLabel = summary?.projectLabel || copy.command.chatLabel;
     await this.adapter.sendCommandReply(
       message.address.chatId,
-      `<b>已新建线程</b>\n\n<b>${escapeHtml(title)}</b>\n项目：${escapeHtml(projectLabel)}`,
+      copy.command.newThread(escapeHtml(title), escapeHtml(projectLabel)),
       message.messageId,
     );
   }
 
   private async switchThread(message: InboundMessage, identifier: string): Promise<void> {
     const currentBinding = this.resolveBinding(message.address.chatId);
+    const copy = getUiText(this.currentUiLanguage(currentBinding));
     const target = this.store.findChatThread(this.channelType, message.address.chatId, identifier);
     if (!target) {
-      await this.adapter.sendText(message.address.chatId, '未找到对应线程。', message.messageId);
+      await this.adapter.sendText(message.address.chatId, copy.command.threadNotFound, message.messageId);
       return;
     }
 
@@ -820,7 +865,7 @@ export class FeishuBridgeService {
       : target;
 
     if (!resolved) {
-      await this.adapter.sendText(message.address.chatId, '导入线程失败。', message.messageId);
+      await this.adapter.sendText(message.address.chatId, copy.command.importThreadFailed, message.messageId);
       return;
     }
 
@@ -841,7 +886,7 @@ export class FeishuBridgeService {
 
     await this.adapter.sendCommandReply(
       message.address.chatId,
-      `<b>已切换线程</b>\n\n<b>${escapeHtml(resolved.title)}</b>\n项目：${escapeHtml(resolved.projectLabel || '聊天')}`,
+      copy.command.switchedThread(escapeHtml(resolved.title), escapeHtml(resolved.projectLabel || copy.command.chatLabel)),
       message.messageId,
     );
 
@@ -851,23 +896,76 @@ export class FeishuBridgeService {
     }
   }
 
-  private async runPermissionTest(message: InboundMessage, binding: ChannelBinding): Promise<void> {
-    await this.handleConversationMessage({
-      ...message,
-      text: 'Run a harmless shell command that requires approval: create and then remove ~/.codex-feishu/.permtest-smoke . Do not do anything else.',
-    }, binding);
+  private resolveUiLanguage(binding: ChannelBinding, inputText: string): UiLanguage {
+    const detected = this.rememberPreferredLanguage(binding, inputText);
+    if (detected) {
+      return detected;
+    }
+
+    return this.currentUiLanguage(binding);
   }
 
-  private async handleConversationMessage(message: InboundMessage, binding: ChannelBinding): Promise<void> {
+  private currentUiLanguage(binding: ChannelBinding): UiLanguage {
+    const recentLanguage = this.detectRecentUiLanguage(binding);
+    if (recentLanguage) {
+      return recentLanguage;
+    }
+    return binding.preferredLanguage || getDefaultUiLanguage();
+  }
+
+  private detectRecentUiLanguage(binding: ChannelBinding): UiLanguage | null {
+    const recentMessages = this.store.getMessages(binding.codepilotSessionId, { limit: 20 }).messages;
+    for (let index = recentMessages.length - 1; index >= 0; index -= 1) {
+      const message = recentMessages[index];
+      if (message.role !== 'user') {
+        continue;
+      }
+      const recentLanguage = detectUiLanguageFromText(message.content);
+      if (!recentLanguage) {
+        continue;
+      }
+      if (binding.preferredLanguage !== recentLanguage) {
+        this.store.updateChannelBinding(binding.id, { preferredLanguage: recentLanguage });
+      }
+      return recentLanguage;
+    }
+    return null;
+  }
+
+  private rememberPreferredLanguage(binding: ChannelBinding, inputText: string): UiLanguage | null {
+    const detected = detectUiLanguageFromText(inputText);
+    if (!detected || binding.preferredLanguage === detected) {
+      return detected;
+    }
+    this.store.updateChannelBinding(binding.id, { preferredLanguage: detected });
+    return detected;
+  }
+
+  private async runPermissionTest(message: InboundMessage, binding: ChannelBinding): Promise<void> {
+    await this.handleConversationMessage(message, binding, {
+      promptOverride: 'Run a harmless shell command that requires approval: create and then remove ~/.codex-feishu/.permtest-smoke . Do not do anything else.',
+      uiLanguage: this.currentUiLanguage(binding),
+    });
+  }
+
+  private async handleConversationMessage(
+    message: InboundMessage,
+    binding: ChannelBinding,
+    options?: { promptOverride?: string; uiLanguage?: UiLanguage },
+  ): Promise<void> {
     const mirrored = await this.maybeMirrorBusyThread(message, binding);
     if (mirrored) return;
 
-    const prompt = truncateInput(message.text || (message.attachments?.length ? 'Describe this attachment.' : ''));
+    const promptSource = options?.promptOverride ?? message.text;
+    const prompt = truncateInput(promptSource || (message.attachments?.length ? 'Describe this attachment.' : ''));
     if (!prompt && !message.attachments?.length) {
       return;
     }
 
-    this.adapter.beginResponse(message.address.chatId, message.messageId);
+    const uiLanguage = options?.uiLanguage || this.resolveUiLanguage(binding, message.text);
+    const copy = getUiText(uiLanguage);
+
+    this.adapter.beginResponse(message.address.chatId, message.messageId, uiLanguage);
     const abortController = new AbortController();
     let inboundAbortListener: (() => void) | null = null;
     if (message.abortSignal) {
@@ -896,7 +994,7 @@ export class FeishuBridgeService {
             this.adapter.updateResponse(message.address.chatId, partialText, tools);
           },
           onPermission: async (payload) => {
-            await this.forwardPermissionRequest(message, binding, payload);
+            await this.forwardPermissionRequest(message, binding, payload, uiLanguage);
           },
         },
       });
@@ -921,11 +1019,11 @@ export class FeishuBridgeService {
         await this.adapter.finalizeResponse(
           message.address.chatId,
           'error',
-          `Error\n\n${result.errorMessage}`,
+          `${copy.command.errorTitle}\n\n${result.errorMessage}`,
           message.messageId,
         );
       } else {
-        await this.adapter.finalizeResponse(message.address.chatId, 'completed', 'Done.', message.messageId);
+        await this.adapter.finalizeResponse(message.address.chatId, 'completed', copy.command.done, message.messageId);
       }
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
@@ -940,13 +1038,15 @@ export class FeishuBridgeService {
   }
 
   private async maybeMirrorBusyThread(message: InboundMessage, binding: ChannelBinding): Promise<boolean> {
+    const uiLanguage = this.resolveUiLanguage(binding, message.text);
+    const copy = getUiText(uiLanguage);
     const busyThread = this.store.getBusyLocalThreadState(binding.codepilotSessionId);
     if (!busyThread) {
       return false;
     }
 
-    await this.adapter.sendText(message.address.chatId, '当前线程忙碌中', message.messageId);
-    this.adapter.beginResponse(message.address.chatId, message.messageId);
+    await this.adapter.sendText(message.address.chatId, copy.command.currentThreadBusy, message.messageId);
+    this.adapter.beginResponse(message.address.chatId, message.messageId, uiLanguage);
 
     const abortController = new AbortController();
     let inboundAbortListener: (() => void) | null = null;
@@ -1015,6 +1115,7 @@ export class FeishuBridgeService {
     message: InboundMessage,
     binding: ChannelBinding,
     payload: PermissionRequestPayload,
+    uiLanguage: UiLanguage,
   ): Promise<void> {
     if (this.channelType === 'rokid' && this.config.rokidAutoAllowPermissions) {
       const resolution: { behavior: 'allow'; updatedPermissions: unknown[] } = {
@@ -1026,12 +1127,13 @@ export class FeishuBridgeService {
           this.permissions.resolve(payload.permissionRequestId, resolution);
         }, 0);
       }
-      const body = renderPermissionRequestBody(binding, payload, { autoAllowed: true });
+      const body = renderPermissionRequestBody(binding, payload, uiLanguage, { autoAllowed: true });
       await this.adapter.sendPermissionRequest(
         message.address.chatId,
         body,
         payload.permissionRequestId,
         message.messageId,
+        uiLanguage,
       );
       return;
     }
@@ -1045,13 +1147,14 @@ export class FeishuBridgeService {
       suggestions: JSON.stringify(payload.suggestions || []),
     });
 
-    const body = renderPermissionRequestBody(binding, payload);
+    const body = renderPermissionRequestBody(binding, payload, uiLanguage);
 
     await this.adapter.sendPermissionRequest(
       message.address.chatId,
       body,
       payload.permissionRequestId,
       message.messageId,
+      uiLanguage,
     );
   }
 
