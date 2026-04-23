@@ -315,15 +315,33 @@ function extractPreviewText(content: string): string {
   return normalizeWhitespace(trimmed);
 }
 
+function isInternalContinuationPrompt(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return false;
+  return normalized.startsWith('continue the conversation using the prior trans');
+}
+
+function isInternalPreviewPayload(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return false;
+  return normalized.startsWith('<environment_context>')
+    || normalized.startsWith('<app-context>')
+    || normalized.startsWith('<collaboration_mode>')
+    || normalized.startsWith('<skills_instructions>')
+    || isInternalContinuationPrompt(normalized);
+}
+
+function isMeaningfulThreadTitle(value: string): boolean {
+  const normalized = normalizeWhitespace(value);
+  return Boolean(normalized) && !isInternalContinuationPrompt(normalized);
+}
+
 function isUsefulUserPreview(value: string): boolean {
   const normalized = value.trim().toLowerCase();
   if (!normalized) return false;
   if (normalized === '[ok]') return false;
   if (normalized === 'hi' || normalized === 'hello' || normalized === 'hello!') return false;
-  if (normalized.startsWith('<environment_context>')) return false;
-  if (normalized.startsWith('<app-context>')) return false;
-  if (normalized.startsWith('<collaboration_mode>')) return false;
-  if (normalized.startsWith('<skills_instructions>')) return false;
+  if (isInternalPreviewPayload(normalized)) return false;
   if (normalized.startsWith('reply with exactly ')) return false;
   if (normalized.startsWith('/')) return false;
   return true;
@@ -332,16 +350,14 @@ function isUsefulUserPreview(value: string): boolean {
 function isUsefulConversationPreview(value: string): boolean {
   const normalized = value.trim().toLowerCase();
   if (!normalized) return false;
-  if (normalized.startsWith('<environment_context>')) return false;
-  if (normalized.startsWith('<app-context>')) return false;
-  if (normalized.startsWith('<collaboration_mode>')) return false;
-  if (normalized.startsWith('<skills_instructions>')) return false;
+  if (isInternalPreviewPayload(normalized)) return false;
   return true;
 }
 
 function isUsefulThreadListPreview(value: string): boolean {
   const normalized = value.trim().toLowerCase();
   if (!normalized) return false;
+  if (isInternalPreviewPayload(normalized)) return false;
   if (normalized === 'threads') return false;
   if (normalized.startsWith('threads ')) return false;
   if (normalized.includes('&nbsp;')) return false;
@@ -811,7 +827,7 @@ export class JsonFileStore implements BridgeStore {
         const parsed = JSON.parse(line) as { id?: string; thread_name?: string };
         const sessionId = parsed.id?.trim();
         const title = parsed.thread_name ? normalizeWhitespace(parsed.thread_name) : '';
-        if (sessionId && title) {
+        if (sessionId && isMeaningfulThreadTitle(title)) {
           titles.set(sessionId, title);
         }
       } catch {
@@ -1161,7 +1177,7 @@ export class JsonFileStore implements BridgeStore {
   }
 
   private getThreadSourceSdkSessionId(record: ThreadRecord): string {
-    return this.getSessionSdkSessionId(record.sessionId) || record.importedSdkSessionId || '';
+    return record.importedSdkSessionId || this.getSessionSdkSessionId(record.sessionId) || '';
   }
 
   private getDesktopPrioritySdkSessionId(record: ThreadRecord): string {
@@ -1172,14 +1188,45 @@ export class JsonFileStore implements BridgeStore {
     return record.importedSdkSessionId || '';
   }
 
+  private resolveManagedThreadTitle(
+    record: ThreadRecord,
+    localThreads: Map<string, LocalCodexThread>,
+    titleIndex: Map<string, string>,
+  ): string {
+    const currentSdkSessionId = this.getSessionSdkSessionId(record.sessionId);
+    const currentTitle = currentSdkSessionId
+      ? localThreads.get(currentSdkSessionId)?.title || titleIndex.get(currentSdkSessionId) || ''
+      : '';
+    if (isMeaningfulThreadTitle(currentTitle)) {
+      return currentTitle;
+    }
+
+    const importedSdkSessionId = record.importedSdkSessionId || '';
+    const importedTitle = importedSdkSessionId
+      ? localThreads.get(importedSdkSessionId)?.title || titleIndex.get(importedSdkSessionId) || ''
+      : '';
+    if (isMeaningfulThreadTitle(importedTitle)) {
+      return importedTitle;
+    }
+
+    if (isMeaningfulThreadTitle(record.title)) {
+      return record.title;
+    }
+
+    return this.defaultThreadTitle(record.sessionId, record.workingDirectory);
+  }
+
   private buildManagedThreadSummary(record: ThreadRecord): ThreadSummary {
     const snapshot = this.loadCodexGlobalState();
+    const localThreads = this.getLocalCodexThreads();
+    const titleIndex = this.loadLocalThreadTitleIndex();
     const sdkSessionId = this.getSessionSdkSessionId(record.sessionId);
     const sourceSdkSessionId = this.getThreadSourceSdkSessionId(record);
-    const fallback = sourceSdkSessionId ? this.getLocalCodexThreads().get(sourceSdkSessionId) || null : null;
-    const indexedTitle = sourceSdkSessionId ? this.loadLocalThreadTitleIndex().get(sourceSdkSessionId) || '' : '';
-    const effectiveLastActiveAt = fallback?.lastActiveAt || record.lastActiveAt;
-    const effectiveTitle = fallback?.title || indexedTitle || record.title;
+    const currentLocal = sdkSessionId ? localThreads.get(sdkSessionId) || null : null;
+    const importedLocal = record.importedSdkSessionId ? localThreads.get(record.importedSdkSessionId) || null : null;
+    const previewSource = currentLocal || importedLocal;
+    const effectiveLastActiveAt = previewSource?.lastActiveAt || record.lastActiveAt;
+    const effectiveTitle = this.resolveManagedThreadTitle(record, localThreads, titleIndex);
     const messages = this.loadMessages(record.sessionId);
     let latestMessagePreview = '';
     let latestMessageRole = '';
@@ -1196,12 +1243,12 @@ export class JsonFileStore implements BridgeStore {
       }
       if (latestMessagePreview && latestUserPreview) break;
     }
-    if (!latestMessagePreview && fallback?.latestMessagePreview) {
-      latestMessagePreview = fallback.latestMessagePreview;
-      latestMessageRole = fallback.latestMessageRole;
+    if (!latestMessagePreview && previewSource?.latestMessagePreview) {
+      latestMessagePreview = previewSource.latestMessagePreview;
+      latestMessageRole = previewSource.latestMessageRole;
     }
-    if (!latestUserPreview && fallback?.latestUserPreview) {
-      latestUserPreview = fallback.latestUserPreview;
+    if (!latestUserPreview && previewSource?.latestUserPreview) {
+      latestUserPreview = previewSource.latestUserPreview;
     }
     return {
       ...record,
@@ -1899,13 +1946,26 @@ export class JsonFileStore implements BridgeStore {
       .map((thread) => this.buildManagedThreadSummary(thread));
     const local = this.listImportableLocalThreads(channelType, chatId);
 
-    return [...managed, ...local]
+    const ordered = [...managed, ...local]
       .sort((a, b) => {
         if (a.lastActiveAt === b.lastActiveAt) {
           return b.createdAt.localeCompare(a.createdAt);
         }
         return b.lastActiveAt.localeCompare(a.lastActiveAt);
       });
+
+    const deduped: ThreadSummary[] = [];
+    const seenDisplayIds = new Set<string>();
+    for (const thread of ordered) {
+      const key = thread.displayId || thread.sessionId;
+      if (!key || !seenDisplayIds.has(key)) {
+        deduped.push(thread);
+      }
+      if (key) {
+        seenDisplayIds.add(key);
+      }
+    }
+    return deduped;
   }
 
   findChatThread(channelType: string, chatId: string, identifier: string): ThreadSummary | null {
@@ -2007,17 +2067,21 @@ export class JsonFileStore implements BridgeStore {
     const record = this.findThreadRecordBySessionId(sessionId);
     if (!record) return;
 
-    const sdkSessionId = this.getSessionSdkSessionId(sessionId);
-    if (!sdkSessionId) return;
-
     this.localCodexThreadCache = null;
-    const local = this.getLocalCodexThreads().get(sdkSessionId);
+    const localThreads = this.getLocalCodexThreads();
+    const sdkSessionId = this.getSessionSdkSessionId(sessionId);
+    const local = (sdkSessionId ? localThreads.get(sdkSessionId) || null : null)
+      || (record.importedSdkSessionId ? localThreads.get(record.importedSdkSessionId) || null : null);
     if (!local) return;
 
     this.upsertThreadRecord(record.channelType, record.chatId, sessionId, {
       title: local.title,
-      workingDirectory: local.workingDirectory,
-      model: local.model,
+      workingDirectory: sdkSessionId && localThreads.get(sdkSessionId)?.workingDirectory
+        ? localThreads.get(sdkSessionId)!.workingDirectory
+        : local.workingDirectory,
+      model: sdkSessionId && localThreads.get(sdkSessionId)?.model
+        ? localThreads.get(sdkSessionId)!.model
+        : local.model,
       touch: false,
     });
   }
